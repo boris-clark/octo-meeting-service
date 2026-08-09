@@ -65,10 +65,11 @@ func requestMetrics(m *observability.Metrics) gin.HandlerFunc {
 // NewHTTPServer wraps an http.Handler with the configured timeouts.
 func NewHTTPServer(cfg config.HTTPConfig, h http.Handler) *http.Server {
 	return &http.Server{
-		Addr:         cfg.Addr,
-		Handler:      h,
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
+		Addr:              cfg.Addr,
+		Handler:           h,
+		ReadTimeout:       cfg.ReadTimeout,
+		ReadHeaderTimeout: cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -19,7 +20,7 @@ type Metrics struct {
 // NewMetrics constructs and registers the baseline collectors.
 func NewMetrics() *Metrics {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(prometheus.NewGoCollector())
+	reg.MustRegister(collectors.NewGoCollector())
 
 	m := &Metrics{
 		registry: reg,

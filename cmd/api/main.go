@@ -74,7 +74,11 @@ func run() error {
 	})
 
 	apiSrv := httpserver.NewHTTPServer(cfg.HTTP, engine)
-	metricsSrv := &http.Server{Addr: cfg.HTTP.MetricsAddr, Handler: metrics.Handler()}
+	metricsSrv := &http.Server{
+		Addr:              cfg.HTTP.MetricsAddr,
+		Handler:           metrics.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	errCh := make(chan error, 2)
 	go func() {
