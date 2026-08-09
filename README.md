@@ -56,6 +56,24 @@ curl -s localhost:8080/readyz
 curl -s localhost:9090/metrics | head
 ```
 
+### Entrypoints
+
+The image `ENTRYPOINT` is `/app/api` (the API binary is the default). The worker
+is a separate binary at `/app/worker`, selected by overriding the entrypoint:
+
+- compose: the `worker` service sets `entrypoint: ["/app/worker"]`.
+- Kubernetes: the worker Deployment sets `command: ["/app/worker"]` (see
+  `deploy/deployment.template.yaml`). A K8s `args` value would be *appended* to
+  the ENTRYPOINT rather than replace it, so `command` is used to guarantee the
+  worker Deployment launches the worker binary and not the API.
+
+Smoke-check the worker locally:
+
+```
+docker compose up --build worker   # logs "worker starting"; SIGTERM drains cleanly
+```
+
+
 ## Build & test
 
 ```

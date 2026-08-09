@@ -29,7 +29,9 @@ spec:
       containers:
         - name: api
           image: REGISTRY/octo-meeting-service:TAG # replaced by the release pipeline
-          args: ["/app/api"]
+          # Explicit command overrides the image ENTRYPOINT so the selected
+          # binary is unambiguous (args would append to ENTRYPOINT, not replace it).
+          command: ["/app/api"]
           ports:
             - name: http
               containerPort: 8080
@@ -88,7 +90,10 @@ spec:
       containers:
         - name: worker
           image: REGISTRY/octo-meeting-service:TAG
-          args: ["/app/worker"]
+          # The image ENTRYPOINT is /app/api; an explicit command is required so
+          # this deployment actually runs the worker binary (args alone would be
+          # appended to the ENTRYPOINT and still launch the API).
+          command: ["/app/worker"]
           envFrom:
             - secretRef:
                 name: octo-meeting-secrets
