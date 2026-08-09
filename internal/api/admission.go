@@ -383,10 +383,16 @@ func (s *Service) Finalize(c *gin.Context) {
 		return
 	}
 
-	// A supplied pass token is validated for this meeting+user.
+	// A supplied pass token is validated for this meeting+user. Propagate store
+	// errors instead of silently downgrading to "invalid".
 	tokenValid := false
 	if req.PasswordPassToken != "" {
-		tokenValid, _ = s.PassTokens.Valid(ctx, req.PasswordPassToken, meetingID, p.UserID, s.now())
+		v, verr := s.PassTokens.Valid(ctx, req.PasswordPassToken, meetingID, p.UserID, s.now())
+		if verr != nil {
+			WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+			return
+		}
+		tokenValid = v
 	}
 
 	mf, cf, err := s.facts(ctx, m, p.UserID, p.OrgID, tokenValid)
@@ -426,19 +432,50 @@ func (s *Service) Finalize(c *gin.Context) {
 		"space_id_hash":          shortHash(m.SpaceID),
 	}
 
+	// Atomic single-use: reserve the pass token BEFORE minting so two concurrent
+	// finalizes on separate instances cannot both mint. The reservation is
+	// released on a retryable LiveKit failure (token stays valid) and committed
+	// only on success.
+	reservedHere := false
+	if req.PasswordPassToken != "" {
+		ok, reserved, rerr := s.PassTokens.Reserve(ctx, req.PasswordPassToken, meetingID, p.UserID, s.now())
+		if rerr != nil {
+			WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+			return
+		}
+		if !ok {
+			// Token expired/invalidated between evaluate and reserve.
+			WriteError(c, merr.New(merr.PasswordPassExpired, "The password pass has expired; verify the password again."))
+			return
+		}
+		if !reserved {
+			// Another finalize holds the reservation and is minting; retry shortly.
+			WriteError(c, merr.New(merr.LiveKitUnavailable, "The media service is temporarily unavailable.").
+				WithDetail("retry_after", 1))
+			return
+		}
+		reservedHere = true
+	}
+
 	// Mint before consuming the pass token: a LiveKit failure must leave the
 	// pass token valid so the client can replay finalize (FD-24/FD-32).
 	tok, err := s.Minter.MintAccess(room, segmentID, role, claims, s.now())
 	if err != nil {
+		if reservedHere {
+			_ = s.PassTokens.Release(ctx, req.PasswordPassToken)
+		}
 		WriteError(c, merr.New(merr.LiveKitUnavailable, "The media service is temporarily unavailable.").
 			WithDetail("retry_after", 2))
 		return
 	}
 
-	// Success: consume the pass token (single-use-on-success) and start the
-	// meeting live on first finalize.
-	if req.PasswordPassToken != "" {
-		_ = s.PassTokens.Consume(ctx, req.PasswordPassToken)
+	// Success: atomically consume the pass token (single-use) and start the
+	// meeting live on first finalize. A commit error is surfaced, not swallowed.
+	if reservedHere {
+		if cerr := s.PassTokens.Commit(ctx, req.PasswordPassToken, meetingID, p.UserID); cerr != nil {
+			WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+			return
+		}
 	}
 	updated, err := s.Store.StartLive(ctx, m.MeetingID, s.now())
 	if err != nil {

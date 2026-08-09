@@ -224,11 +224,13 @@ var _ repo.Store = (*MySQLStore)(nil)
 
 // CreateMeeting implements repo.Store. It persists the meeting, its credential
 // (with store-derived HMAC lookup hashes), and an optional password verifier in
-// one transaction, guarded by the idempotency key.
-func (s *MySQLStore) CreateMeeting(ctx context.Context, in repo.CreateInput) (repo.Meeting, bool, error) {
+// one transaction, guarded by the idempotency key. On replay it returns the
+// ORIGINAL persisted credential ciphertexts (loaded from meeting_credential) so
+// the handler never echoes freshly-minted, unpersisted credentials.
+func (s *MySQLStore) CreateMeeting(ctx context.Context, in repo.CreateInput) (repo.CreateResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return repo.Meeting{}, false, fmt.Errorf("create meeting: begin: %w", err)
+		return repo.CreateResult{}, fmt.Errorf("create meeting: begin: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -246,33 +248,39 @@ func (s *MySQLStore) CreateMeeting(ctx context.Context, in repo.CreateInput) (re
 		switch {
 		case err == nil:
 			if fingerprint != in.PayloadFingerprint {
-				return repo.Meeting{}, false, repo.ErrIdempotencyConflict
+				return repo.CreateResult{}, repo.ErrIdempotencyConflict
 			}
 			m, rerr := scanMeeting(tx.QueryRowContext(ctx, `SELECT `+meetingColumns("")+` FROM meeting WHERE meeting_id = ?`, resultRef))
 			if rerr != nil {
-				return repo.Meeting{}, false, fmt.Errorf("create meeting: replay load: %w", rerr)
+				return repo.CreateResult{}, fmt.Errorf("create meeting: replay load: %w", rerr)
+			}
+			var numberCT, linkCT []byte
+			if cerr := tx.QueryRowContext(ctx,
+				`SELECT number_display_ciphertext, link_token_ciphertext FROM meeting_credential WHERE meeting_id = ?`,
+				resultRef).Scan(&numberCT, &linkCT); cerr != nil {
+				return repo.CreateResult{}, fmt.Errorf("create meeting: replay credential: %w", cerr)
 			}
 			if cerr := tx.Commit(); cerr != nil {
-				return repo.Meeting{}, false, cerr
+				return repo.CreateResult{}, cerr
 			}
 			committed = true
-			return m, true, nil
+			return repo.CreateResult{Meeting: m, Replayed: true, NumberCiphertext: numberCT, LinkCiphertext: linkCT}, nil
 		case errors.Is(err, sql.ErrNoRows):
 			// fall through to insert
 		default:
-			return repo.Meeting{}, false, fmt.Errorf("create meeting: idem lookup: %w", err)
+			return repo.CreateResult{}, fmt.Errorf("create meeting: idem lookup: %w", err)
 		}
 	}
 
 	if err := s.insertMeeting(ctx, tx, in.Meeting); err != nil {
-		return repo.Meeting{}, false, err
+		return repo.CreateResult{}, err
 	}
 	if err := s.insertCredential(ctx, tx, in); err != nil {
-		return repo.Meeting{}, false, err
+		return repo.CreateResult{}, err
 	}
 	if in.Verifier != nil {
 		if err := s.insertVerifier(ctx, tx, in.Meeting.MeetingID, in.Meeting.CreatorUID, *in.Verifier); err != nil {
-			return repo.Meeting{}, false, err
+			return repo.CreateResult{}, err
 		}
 	}
 	if in.IdempotencyKey != "" {
@@ -280,15 +288,15 @@ func (s *MySQLStore) CreateMeeting(ctx context.Context, in repo.CreateInput) (re
 			`INSERT INTO meeting_idempotency_key (scope, key_hash, payload_fingerprint, result_ref, expires_at)
 			 VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 HOUR))`,
 			in.IdempotencyScope, s.lookupHash(in.IdempotencyScope+"|"+in.IdempotencyKey), in.PayloadFingerprint, in.Meeting.MeetingID); err != nil {
-			return repo.Meeting{}, false, fmt.Errorf("create meeting: idem insert: %w", err)
+			return repo.CreateResult{}, fmt.Errorf("create meeting: idem insert: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return repo.Meeting{}, false, fmt.Errorf("create meeting: commit: %w", err)
+		return repo.CreateResult{}, fmt.Errorf("create meeting: commit: %w", err)
 	}
 	committed = true
-	return in.Meeting, false, nil
+	return repo.CreateResult{Meeting: in.Meeting, Replayed: false, NumberCiphertext: in.NumberCiphertext, LinkCiphertext: in.LinkCiphertext}, nil
 }
 
 func (s *MySQLStore) insertMeeting(ctx context.Context, tx *sql.Tx, m repo.Meeting) error {

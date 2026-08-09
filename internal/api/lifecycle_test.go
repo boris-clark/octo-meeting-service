@@ -135,12 +135,27 @@ func TestQuickCreatePasswordFormat(t *testing.T) {
 
 func TestQuickCreateIdempotency(t *testing.T) {
 	h := newCreateHarness(t, time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC))
+	h.space.members["space-1|alice"] = true
 	hdr := map[string]string{"Idempotency-Key": "req-1"}
 
 	a := decodeCreated(t, h.post(t, "/v1/meetings/quick-create", "tok-alice", map[string]any{"topic": "x"}, hdr))
 	b := decodeCreated(t, h.post(t, "/v1/meetings/quick-create", "tok-alice", map[string]any{"topic": "x"}, hdr))
 	if a.MeetingID != b.MeetingID {
 		t.Fatalf("same key+payload must replay first result: %q vs %q", a.MeetingID, b.MeetingID)
+	}
+	// Blocker XIN-1806#1: the replay must echo the ORIGINAL credentials, not a
+	// freshly-minted number that was never persisted.
+	if b.MeetingNumber != a.MeetingNumber {
+		t.Fatalf("replay number %q != original %q", b.MeetingNumber, a.MeetingNumber)
+	}
+	if b.JoinLink != a.JoinLink || b.JoinLink == "" {
+		t.Fatalf("replay join link %q != original %q", b.JoinLink, a.JoinLink)
+	}
+	// And the replayed number actually resolves through admission evaluate.
+	ev := h.post(t, "/v1/meetings/admission/evaluate", "tok-alice",
+		map[string]any{"source": "number", "meeting_number": b.MeetingNumber}, nil)
+	if ev.Code != http.StatusOK {
+		t.Fatalf("replayed number must resolve: got %d body=%s", ev.Code, ev.Body.String())
 	}
 
 	// Same key, different payload -> conflict.

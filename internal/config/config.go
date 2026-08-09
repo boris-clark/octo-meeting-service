@@ -209,6 +209,21 @@ func (c *Config) Validate() error {
 	if c.Redis.Addr == "" {
 		missing = append(missing, "redis.addr")
 	}
+	// These secrets/URLs are wired into credential minting, password hashing, and
+	// join-link generation; boot fails closed rather than hashing without a
+	// pepper or returning relative join links.
+	if c.Credential.LookupSecret == "" {
+		missing = append(missing, "credential.lookup_secret")
+	}
+	if c.Credential.EnvelopeKey == "" {
+		missing = append(missing, "credential.envelope_key")
+	}
+	if c.Password.Pepper == "" {
+		missing = append(missing, "password.pepper")
+	}
+	if c.PublicBaseURL == "" {
+		missing = append(missing, "public_base_url")
+	}
 	if c.HTTP.BasePath == "" || !strings.HasPrefix(c.HTTP.BasePath, "/") {
 		return fmt.Errorf("http.base_path must be an absolute path, got %q", c.HTTP.BasePath)
 	}

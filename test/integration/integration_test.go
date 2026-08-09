@@ -67,7 +67,7 @@ func TestCreateResolveStartLiveMySQL(t *testing.T) {
 	id := "it-" + number
 
 	enc, _ := password.DefaultArgon2Params().Hash("424242", "it-pepper")
-	created, replayed, err := store.CreateMeeting(ctx, repo.CreateInput{
+	res, err := store.CreateMeeting(ctx, repo.CreateInput{
 		Meeting: repo.Meeting{
 			MeetingID: id, SpaceID: "it-space", Type: meeting.TypeScheduled,
 			Status: meeting.StatusScheduled, CreatorUID: "it-creator", HostUID: "it-creator",
@@ -81,8 +81,8 @@ func TestCreateResolveStartLiveMySQL(t *testing.T) {
 		},
 		IdempotencyScope: "schedule", IdempotencyKey: "it-key-" + id, PayloadFingerprint: "fp1",
 	})
-	if err != nil || replayed {
-		t.Fatalf("CreateMeeting: replayed=%v err=%v", replayed, err)
+	if err != nil || res.Replayed {
+		t.Fatalf("CreateMeeting: replayed=%v err=%v", res.Replayed, err)
 	}
 
 	for _, tc := range []struct {
@@ -95,14 +95,22 @@ func TestCreateResolveStartLiveMySQL(t *testing.T) {
 		}
 	}
 
-	// Idempotent replay returns the first result.
-	if _, replayed2, err := store.CreateMeeting(ctx, repo.CreateInput{
+	// Idempotent replay returns the first result AND the original persisted
+	// credential ciphertext, which decrypts back to the original number.
+	replay, err := store.CreateMeeting(ctx, repo.CreateInput{
 		Meeting:          repo.Meeting{MeetingID: id + "-dup", SpaceID: "it-space", Type: meeting.TypeScheduled, Status: meeting.StatusScheduled, CreatorUID: "it-creator", HostUID: "it-creator", MaxParticipants: 100, Version: 1},
 		Number:           number + "0",
 		LinkToken:        link + "0",
 		IdempotencyScope: "schedule", IdempotencyKey: "it-key-" + id, PayloadFingerprint: "fp1",
-	}); err != nil || !replayed2 {
-		t.Fatalf("replay: replayed=%v err=%v", replayed2, err)
+	})
+	if err != nil || !replay.Replayed {
+		t.Fatalf("replay: replayed=%v err=%v", replay.Replayed, err)
+	}
+	if replay.Meeting.MeetingID != id {
+		t.Fatalf("replay returned wrong meeting: %q", replay.Meeting.MeetingID)
+	}
+	if gotNum, oerr := minter.Open(replay.NumberCiphertext); oerr != nil || gotNum != number {
+		t.Fatalf("replay number: got %q err=%v, want original %q", gotNum, oerr, number)
 	}
 
 	// First finalize starts the meeting live.
@@ -119,7 +127,6 @@ func TestCreateResolveStartLiveMySQL(t *testing.T) {
 	if ok, _ := verifier.Verify(ctx, id, "000000"); ok {
 		t.Fatal("verify wrong password returned true")
 	}
-	_ = created
 }
 
 // TestRedisStoresIntegration exercises the cooldown and pass-token hot paths

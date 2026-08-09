@@ -54,12 +54,23 @@ func (s *MemCooldownStore) Put(_ context.Context, meetingID, uid string, st pass
 }
 
 // PassTokenStore issues and validates single-use-on-success password pass
-// tokens. A token is bound to a meeting+user and expires at a TTL. Consume
-// removes it (called only inside a successful finalize transaction).
+// tokens. A token is bound to a meeting+user and expires at a TTL. Single-use is
+// enforced by a reserve/commit protocol: Reserve atomically re-validates and
+// takes a single-flight reservation before LiveKit mint; Commit consumes on mint
+// success; Release clears the reservation so a LiveKit failure can retry.
 type PassTokenStore interface {
 	Issue(ctx context.Context, meetingID, uid string, expiresAt time.Time) (string, error)
 	Valid(ctx context.Context, token, meetingID, uid string, now time.Time) (bool, error)
 	ValidForUser(ctx context.Context, meetingID, uid string, now time.Time) (bool, error)
+	// Reserve atomically re-validates the token and takes a single-flight
+	// reservation. ok=false => invalid/expired; reserved=false => another finalize
+	// already holds the reservation.
+	Reserve(ctx context.Context, token, meetingID, uid string, now time.Time) (ok bool, reserved bool, err error)
+	// Commit deletes the token, its user marker, and the reservation (single-use).
+	Commit(ctx context.Context, token, meetingID, uid string) error
+	// Release clears only the reservation, leaving the token valid for retry.
+	Release(ctx context.Context, token string) error
+	// Consume removes a token given only the token (outside the reserve protocol).
 	Consume(ctx context.Context, token string) error
 }
 
@@ -67,9 +78,11 @@ type passEntry struct {
 	meetingID string
 	uid       string
 	expiresAt time.Time
+	reserved  bool
 }
 
-// MemPassTokenStore is an in-memory PassTokenStore.
+// MemPassTokenStore is an in-memory PassTokenStore. Its mutex makes the
+// reserve/commit protocol trivially atomic.
 type MemPassTokenStore struct {
 	mu sync.Mutex
 	m  map[string]passEntry
@@ -112,6 +125,41 @@ func (s *MemPassTokenStore) ValidForUser(_ context.Context, meetingID, uid strin
 		}
 	}
 	return false, nil
+}
+
+// Reserve implements PassTokenStore.
+func (s *MemPassTokenStore) Reserve(_ context.Context, token, meetingID, uid string, now time.Time) (bool, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.m[token]
+	if !ok || e.meetingID != meetingID || e.uid != uid || !now.Before(e.expiresAt) {
+		return false, false, nil
+	}
+	if e.reserved {
+		return true, false, nil
+	}
+	e.reserved = true
+	s.m[token] = e
+	return true, true, nil
+}
+
+// Commit implements PassTokenStore.
+func (s *MemPassTokenStore) Commit(_ context.Context, token, _, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, token)
+	return nil
+}
+
+// Release implements PassTokenStore.
+func (s *MemPassTokenStore) Release(_ context.Context, token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.m[token]; ok {
+		e.reserved = false
+		s.m[token] = e
+	}
+	return nil
 }
 
 // Consume implements PassTokenStore.

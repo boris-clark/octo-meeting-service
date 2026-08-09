@@ -6,6 +6,10 @@ func TestLoad_BindsEnv(t *testing.T) {
 	t.Setenv("OCTO_MEETING_MYSQL__DSN", "u:p@tcp(localhost:3306)/db")
 	t.Setenv("OCTO_MEETING_REDIS__ADDR", "localhost:6379")
 	t.Setenv("OCTO_MEETING_WORKER__CONCURRENCY", "7")
+	t.Setenv("OCTO_MEETING_CREDENTIAL__LOOKUP_SECRET", "ls")
+	t.Setenv("OCTO_MEETING_CREDENTIAL__ENVELOPE_KEY", "ek")
+	t.Setenv("OCTO_MEETING_PASSWORD__PEPPER", "pep")
+	t.Setenv("OCTO_MEETING_PUBLIC_BASE_URL", "https://octo.example")
 
 	cfg, err := Load()
 	if err != nil {
@@ -38,6 +42,10 @@ func baseValid() *Config {
 	c.MySQL.DSN = "user:pass@tcp(localhost:3306)/octo_meeting"
 	c.Redis.Addr = "localhost:6379"
 	c.Worker.Concurrency = 4
+	c.Credential.LookupSecret = "lookup-secret"
+	c.Credential.EnvelopeKey = "envelope-secret"
+	c.Password.Pepper = "pepper"
+	c.PublicBaseURL = "https://octo.example"
 	return c
 }
 
@@ -76,5 +84,37 @@ func TestValidate_BadConcurrency(t *testing.T) {
 	c.Worker.Concurrency = 0
 	if err := c.Validate(); err == nil {
 		t.Fatal("expected error for zero worker concurrency")
+	}
+}
+
+func TestValidate_MissingEnvelopeKey(t *testing.T) {
+	c := baseValid()
+	c.Credential.EnvelopeKey = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing credential.envelope_key")
+	}
+}
+
+func TestValidate_MissingLookupSecret(t *testing.T) {
+	c := baseValid()
+	c.Credential.LookupSecret = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing credential.lookup_secret")
+	}
+}
+
+func TestValidate_MissingPepper(t *testing.T) {
+	c := baseValid()
+	c.Password.Pepper = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing password.pepper")
+	}
+}
+
+func TestValidate_MissingPublicBaseURL(t *testing.T) {
+	c := baseValid()
+	c.PublicBaseURL = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected error for missing public_base_url")
 	}
 }

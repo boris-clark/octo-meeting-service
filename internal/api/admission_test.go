@@ -347,6 +347,15 @@ func (s *spyPassTokens) ValidForUser(ctx context.Context, m, u string, now time.
 func (s *spyPassTokens) Consume(ctx context.Context, t string) error {
 	return s.inner.Consume(ctx, t)
 }
+func (s *spyPassTokens) Reserve(ctx context.Context, t, m, u string, now time.Time) (bool, bool, error) {
+	return s.inner.Reserve(ctx, t, m, u, now)
+}
+func (s *spyPassTokens) Commit(ctx context.Context, t, m, u string) error {
+	return s.inner.Commit(ctx, t, m, u)
+}
+func (s *spyPassTokens) Release(ctx context.Context, t string) error {
+	return s.inner.Release(ctx, t)
+}
 
 func newSpyHarness(t *testing.T) (*harness, *spyCooldown, *spyVerifier, *spyPassTokens) {
 	t.Helper()

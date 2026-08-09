@@ -60,9 +60,20 @@ type Store interface {
 	StartLive(ctx context.Context, meetingID string, now time.Time) (Meeting, error)
 	// CreateMeeting persists a new meeting with its credential (and optional
 	// password verifier) under an idempotency guard. A duplicate idempotency key
-	// with the same payload returns the first result (replayed=true); a duplicate
-	// key with a different payload returns ErrIdempotencyConflict.
-	CreateMeeting(ctx context.Context, in CreateInput) (Meeting, bool, error)
+	// with the same payload returns the first result (CreateResult.Replayed=true)
+	// carrying the ORIGINAL persisted credential ciphertexts; a duplicate key
+	// with a different payload returns ErrIdempotencyConflict.
+	CreateMeeting(ctx context.Context, in CreateInput) (CreateResult, error)
+}
+
+// CreateResult is the outcome of CreateMeeting. On a replay it carries the
+// original persisted credential ciphertexts (not freshly-minted values) so the
+// handler can echo credentials that actually resolve.
+type CreateResult struct {
+	Meeting          Meeting
+	Replayed         bool
+	NumberCiphertext []byte
+	LinkCiphertext   []byte
 }
 
 // MemStore is an in-memory Store for tests.
@@ -76,11 +87,18 @@ type MemStore struct {
 	participants map[string]bool
 	activeCount  map[string]int
 	idem         map[string]idemRecord
+	creds        map[string]storedCreds
 }
 
 type idemRecord struct {
 	meetingID   string
 	fingerprint string
+}
+
+// storedCreds holds the original credential ciphertexts for replay.
+type storedCreds struct {
+	numberCT []byte
+	linkCT   []byte
 }
 
 // NewMemStore builds an empty in-memory store.
@@ -94,6 +112,7 @@ func NewMemStore() *MemStore {
 		participants: map[string]bool{},
 		activeCount:  map[string]int{},
 		idem:         map[string]idemRecord{},
+		creds:        map[string]storedCreds{},
 	}
 }
 
@@ -228,7 +247,7 @@ type CreateInput struct {
 }
 
 // CreateMeeting implements Store for the in-memory store.
-func (m *MemStore) CreateMeeting(_ context.Context, in CreateInput) (Meeting, bool, error) {
+func (m *MemStore) CreateMeeting(_ context.Context, in CreateInput) (CreateResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -236,10 +255,12 @@ func (m *MemStore) CreateMeeting(_ context.Context, in CreateInput) (Meeting, bo
 		k := key(in.IdempotencyScope, in.IdempotencyKey)
 		if rec, ok := m.idem[k]; ok {
 			if rec.fingerprint != in.PayloadFingerprint {
-				return Meeting{}, false, ErrIdempotencyConflict
+				return CreateResult{}, ErrIdempotencyConflict
 			}
 			existing := m.byID[rec.meetingID]
-			return *existing, true, nil
+			orig := m.creds[rec.meetingID]
+			// Return the ORIGINAL persisted credential ciphertexts on replay.
+			return CreateResult{Meeting: *existing, Replayed: true, NumberCiphertext: orig.numberCT, LinkCiphertext: orig.linkCT}, nil
 		}
 		m.idem[k] = idemRecord{meetingID: in.Meeting.MeetingID, fingerprint: in.PayloadFingerprint}
 	}
@@ -252,5 +273,6 @@ func (m *MemStore) CreateMeeting(_ context.Context, in CreateInput) (Meeting, bo
 	if in.LinkToken != "" {
 		m.byLink[in.LinkToken] = cp.MeetingID
 	}
-	return cp, false, nil
+	m.creds[cp.MeetingID] = storedCreds{numberCT: in.NumberCiphertext, linkCT: in.LinkCiphertext}
+	return CreateResult{Meeting: cp, Replayed: false, NumberCiphertext: in.NumberCiphertext, LinkCiphertext: in.LinkCiphertext}, nil
 }

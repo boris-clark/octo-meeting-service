@@ -177,7 +177,7 @@ func (s *Service) persistCreated(c *gin.Context, rec repo.Meeting, rawPassword, 
 		}
 	}
 
-	created, replayed, err := s.Store.CreateMeeting(c.Request.Context(), in)
+	result, err := s.Store.CreateMeeting(c.Request.Context(), in)
 	if err == repo.ErrIdempotencyConflict {
 		WriteError(c, merr.New(merr.IdempotencyConflict, "The idempotency key was reused with a different request."))
 		return
@@ -187,21 +187,30 @@ func (s *Service) persistCreated(c *gin.Context, rec repo.Meeting, rawPassword, 
 		return
 	}
 
-	// On an idempotent replay we return the first result. The join link is only
-	// echoed on the fresh create (we do not re-derive the raw link from at-rest
-	// ciphertext here).
-	joinLink := ""
-	if !replayed {
-		joinLink = s.joinLink(link)
+	// Determine the credentials to echo. On a fresh create these are the values
+	// just minted. On an idempotent replay we return the ORIGINAL persisted
+	// credentials (decrypted from the stored ciphertext) so the caller gets a
+	// meeting number and join link that actually resolve — never freshly-minted
+	// values that were never persisted.
+	respNumber, respLink := number, link
+	if result.Replayed {
+		origNumber, oerr := s.Credentials.Open(result.NumberCiphertext)
+		origLink, lerr := s.Credentials.Open(result.LinkCiphertext)
+		if oerr != nil || lerr != nil {
+			WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+			return
+		}
+		respNumber, respLink = origNumber, origLink
 	}
+
 	WriteJSON(c, http.StatusOK, meetingCreatedResponse{
-		MeetingID:       created.MeetingID,
-		Type:            string(created.Type),
-		Status:          string(created.Status),
-		MeetingNumber:   number,
-		JoinLink:        joinLink,
-		PasswordEnabled: created.PasswordEnabled,
-		Version:         created.Version,
+		MeetingID:       result.Meeting.MeetingID,
+		Type:            string(result.Meeting.Type),
+		Status:          string(result.Meeting.Status),
+		MeetingNumber:   respNumber,
+		JoinLink:        s.joinLink(respLink),
+		PasswordEnabled: result.Meeting.PasswordEnabled,
+		Version:         result.Meeting.Version,
 	})
 }
 
