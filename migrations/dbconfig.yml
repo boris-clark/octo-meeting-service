@@ -1,0 +1,11 @@
+development:
+  dialect: mysql
+  datasource: ${OCTO_MEETING_MYSQL__DSN}
+  dir: migrations
+  table: schema_migrations
+
+production:
+  dialect: mysql
+  datasource: ${OCTO_MEETING_MYSQL__DSN}
+  dir: migrations
+  table: schema_migrations

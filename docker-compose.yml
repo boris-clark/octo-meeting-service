@@ -1,0 +1,63 @@
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: octo_meeting
+      MYSQL_USER: octo
+      MYSQL_PASSWORD: octo
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      args:
+        VERSION: local
+        COMMIT: dev
+    environment:
+      OCTO_MEETING_ENV: development
+      OCTO_MEETING_HTTP__ADDR: ":8080"
+      OCTO_MEETING_HTTP__METRICS_ADDR: ":9090"
+      OCTO_MEETING_MYSQL__DSN: "octo:octo@tcp(mysql:3306)/octo_meeting?parseTime=true&charset=utf8mb4"
+      OCTO_MEETING_REDIS__ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      args:
+        VERSION: local
+        COMMIT: dev
+    entrypoint: ["/app/worker"]
+    environment:
+      OCTO_MEETING_ENV: development
+      OCTO_MEETING_MYSQL__DSN: "octo:octo@tcp(mysql:3306)/octo_meeting?parseTime=true&charset=utf8mb4"
+      OCTO_MEETING_REDIS__ADDR: "redis:6379"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

@@ -1,0 +1,207 @@
+# Error catalog snapshot — authoritative wire contract
+#
+# Bound to architecture SHA-256 f0f482c0add1cfe81edb8cdab6418c63097be995037b582c339bbaeec0a8e871
+# (architecture §7.3 / backend appendix §5.2). This is the single source of
+# truth for the service's stable error taxonomy. Implementations MUST NOT add,
+# rename, or abbreviate codes; the frontend typed-client / MSW / E2E layers
+# reconcile against this file field-for-field.
+#
+# Envelope (see error_response in openapi.yaml), snake_case:
+#   { "code": "...", "message": "...", "details": { ... }, "request_id": "..." }
+# `details` carries only the safe keys listed per code below. Messages and
+# details MUST never contain a raw password, raw link token, password verifier,
+# pepper reference, LiveKit token/secret, or an unauthorized member list.
+#
+# Security invariants encoded here:
+#   * Cross-Space enumeration (S-1): a caller not authorized to know a meeting
+#     exists always receives MEETING_CREDENTIAL_INVALID (404), indistinguishable
+#     from a non-existent meeting. MEETING_NOT_SAME_SPACE is only ever returned
+#     to a caller already authorized to know the meeting exists
+#     (creator / invitee / existing participant / same-Space active member).
+#   * The FD-27 step-1 admission oracle returns the FIRST failing predicate in
+#     the fixed order below; `admission_order` records that order.
+
+version: r4-go-f0f482c0
+architecture_sha256: f0f482c0add1cfe81edb8cdab6418c63097be995037b582c339bbaeec0a8e871
+go_runtime_revision_sha256: 28e3712d1aa6b5db166067404770f90314ffbf3c45eaffa70a17a3f7e16ed723
+
+# Fixed FD-27 step-1 evaluation order. Both admission/evaluate and
+# admission/finalize use this exact order; on multiple simultaneous failures the
+# first listed predicate wins. The whole list sits inside the S-1 authorization
+# envelope: an unauthorized caller collapses every one of these to
+# MEETING_CREDENTIAL_INVALID (404).
+admission_order:
+  - predicate: credential_resolves_to_existing_meeting
+    error: MEETING_CREDENTIAL_INVALID
+  - predicate: not_ended
+    error: MEETING_ENDED
+  - predicate: not_cancelled
+    error: MEETING_CANCELLED
+  - predicate: not_locked
+    error: MEETING_LOCKED
+  - predicate: not_full
+    error: MEETING_FULL
+  - predicate: caller_not_removed
+    error: MEETING_REMOVED
+  - predicate: within_early_join_window
+    error: MEETING_TOO_EARLY
+  - predicate: same_space_active_member
+    error: MEETING_NOT_SAME_SPACE
+
+errors:
+  - code: MEETING_AUTH_REQUIRED
+    http_status: 401
+    retryable: after_login
+    safe_details: []
+    directive: REDIRECT_LOGIN
+    message: Authentication is required or the session has expired.
+  - code: MEETING_CREDENTIAL_INVALID
+    http_status: 404
+    retryable: false
+    safe_details: []
+    directive: SHOW_INVALID_CREDENTIAL
+    # Also returned for any cross-Space / unauthorized guess (S-1): never reveals
+    # whether the meeting exists, is password-protected, or its state.
+    message: The meeting number or link is invalid.
+  - code: MEETING_ENDED
+    http_status: 410
+    retryable: false
+    safe_details: [ended_at]
+    directive: SHOW_ENDED
+    message: The meeting has ended.
+  - code: MEETING_CANCELLED
+    http_status: 410
+    retryable: false
+    safe_details: [cancelled_at]
+    directive: SHOW_CANCELLED
+    message: The meeting was cancelled.
+  - code: MEETING_TOO_EARLY
+    http_status: 409
+    retryable: after_time
+    safe_details: [earliest_join_at]
+    directive: SHOW_TOO_EARLY
+    # earliest_join_at = scheduled_start_at - MEETING_EARLY_JOIN_WINDOW_SECONDS (default 600).
+    message: The meeting is not open for joining yet.
+  - code: MEETING_LOCKED
+    http_status: 423
+    retryable: maybe
+    safe_details: []
+    directive: SHOW_LOCKED
+    message: The meeting is locked to new participants.
+  - code: MEETING_FULL
+    http_status: 409
+    retryable: maybe
+    safe_details: [max_participants]
+    directive: SHOW_FULL
+    message: The meeting is at capacity.
+  - code: MEETING_REMOVED
+    http_status: 403
+    retryable: false
+    safe_details: []
+    directive: EXIT_FLOW
+    message: You have been removed from this meeting.
+  - code: MEETING_NOT_SAME_SPACE
+    http_status: 403
+    retryable: false
+    safe_details: []
+    directive: SHOW_WRONG_SPACE
+    # Only returned to callers already authorized to know the meeting exists.
+    # Unauthorized cross-Space guesses collapse to MEETING_CREDENTIAL_INVALID (S-1).
+    message: The meeting belongs to a different Space.
+  - code: MEETING_PASSWORD_REQUIRED
+    http_status: 428
+    retryable: after_password
+    safe_details: [password_challenge_id, expires_at]
+    directive: SHOW_PASSWORD_CHALLENGE
+    message: A meeting password is required.
+  - code: MEETING_PASSWORD_FORMAT_INVALID
+    http_status: 422
+    retryable: true
+    safe_details: [format]
+    directive: FOCUS_PASSWORD_INPUT
+    # format = "6_digit"; a format failure is rejected before the verifier lookup
+    # and does not count against the attempt budget.
+    message: The password must be 6 digits.
+  - code: MEETING_PASSWORD_INVALID
+    http_status: 401
+    retryable: until_cooldown
+    safe_details: [attempts_remaining, cooldown_until]
+    directive: SHOW_PASSWORD_ERROR
+    message: The password is incorrect.
+  - code: MEETING_PASSWORD_COOLDOWN
+    http_status: 429
+    retryable: after_cooldown
+    safe_details: [retry_at]
+    directive: SHOW_PASSWORD_COOLDOWN
+    message: Too many incorrect attempts; try again later.
+  - code: MEETING_PASSWORD_PASS_EXPIRED
+    http_status: 401
+    retryable: true
+    safe_details: []
+    directive: SHOW_PASSWORD_CHALLENGE
+    # The password pass token expired; return to the challenge and verify again.
+    message: The password pass has expired; verify the password again.
+  - code: MEETING_PASSWORD_IMMUTABLE
+    http_status: 409
+    retryable: false
+    safe_details: [status]
+    directive: DISABLE_PASSWORD_EDIT
+    message: The password cannot be changed after the meeting is live.
+  - code: MEETING_FORBIDDEN
+    http_status: 403
+    retryable: false
+    safe_details: [required_role]
+    directive: REFRESH_ROLE
+    message: You do not have permission to perform this action.
+  - code: MEETING_VERSION_CONFLICT
+    http_status: 409
+    retryable: after_reload
+    safe_details: [current_version]
+    directive: RELOAD_DETAIL
+    message: The meeting was modified; reload and retry.
+  - code: MEETING_IDEMPOTENCY_CONFLICT
+    http_status: 409
+    retryable: false
+    safe_details: []
+    directive: STOP_RETRY
+    message: The idempotency key was reused with a different request.
+  - code: MEETING_SHARE_CONFLICT
+    http_status: 409
+    retryable: after_stop
+    safe_details: [holder_uid]
+    directive: SHOW_SHARE_CONFLICT
+    message: Another participant is already sharing.
+  - code: MEETING_LIVEKIT_UNAVAILABLE
+    http_status: 503
+    retryable: true
+    safe_details: [retry_after]
+    directive: RETAIN_PREJOIN_AND_RETRY
+    # The password_pass_token stays valid within its TTL; the client stays in
+    # PreJoin and replays finalize after retry_after — it does not return to the
+    # password challenge.
+    message: The media service is temporarily unavailable.
+  - code: MEETING_NOTIFICATION_DEFERRED
+    http_status: 202
+    retryable: system_retry
+    safe_details: [deferred_count]
+    directive: SHOW_DEFERRED_WARNING
+    # Non-blocking warning: the meeting change succeeded; notifications are queued.
+    message: The meeting was updated; notifications will be delivered shortly.
+  - code: MEETING_TIME_INVALID
+    http_status: 422
+    retryable: after_edit
+    safe_details: [server_now, allowed_window]
+    directive: HIGHLIGHT_TIME_FIELD
+    message: The scheduled time is invalid.
+  - code: MEETING_RATE_LIMITED
+    http_status: 429
+    retryable: after_retry
+    safe_details: [retry_after]
+    directive: SHOW_RATE_LIMIT
+    message: Too many requests; retry later.
+  - code: MEETING_INTERNAL
+    http_status: 500
+    retryable: if_safe
+    safe_details: [request_id]
+    directive: SHOW_GENERIC_RETRY
+    message: An unexpected error occurred.

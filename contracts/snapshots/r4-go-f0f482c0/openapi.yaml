@@ -1,0 +1,945 @@
+openapi: 3.0.3
+info:
+  title: Octo Meeting Service
+  version: r4-go-f0f482c0
+  description: >
+    Service-owned, authoritative OpenAPI snapshot for the standalone Octo Meeting
+    service. Bound to architecture SHA-256
+    f0f482c0add1cfe81edb8cdab6418c63097be995037b582c339bbaeec0a8e871 and Go runtime
+    revision 28e3712d1aa6b5db166067404770f90314ffbf3c45eaffa70a17a3f7e16ed723.
+
+
+    This snapshot is the single source of truth for the public HTTP contract
+    (architecture §7 / backend appendix §5). The frontend typed-client, MSW
+    fixtures, and E2E reconcile against it. Wire format is snake_case; timestamps
+    are UTC ISO-8601. The stable error taxonomy lives alongside in errors.yaml and
+    is surfaced here as the error_response envelope.
+
+
+    Handlers may be stubbed while this contract is published early to unblock the
+    frontend; the shapes below are frozen regardless of handler readiness.
+servers:
+  - url: /meeting/api/v1
+    description: Public gateway base path (browser / desktop entry).
+  - url: /v1
+    description: Canonical service path behind the gateway.
+
+tags:
+  - name: operational
+    description: Liveness, readiness, metrics.
+  - name: meetings
+    description: Create, schedule, edit, cancel, list, and inspect meetings.
+  - name: admission
+    description: Public admission evaluation, password challenge, and finalize.
+  - name: controls
+    description: In-meeting host/cohost controls, roster, sharing, lifecycle.
+  - name: webhook
+    description: LiveKit webhook reconciliation.
+
+paths:
+  /healthz:
+    get:
+      tags: [operational]
+      operationId: liveness
+      summary: Liveness probe
+      description: Always 200 while the process is serving; does not touch dependencies.
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [operational]
+      operationId: readiness
+      summary: Readiness probe
+      description: >
+        200 only when every registered dependency (DB migration applied, Redis,
+        auth/Space seam, LiveKit API when token mint is enabled, worker claim
+        store) is reachable, else 503. If the notification seam is down but the
+        outbox is healthy, readiness may stay ready with a degraded flag.
+      responses:
+        "200":
+          description: All dependencies ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/readiness_response" }
+        "503":
+          description: One or more dependencies not ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/readiness_response" }
+
+  /metrics:
+    get:
+      tags: [operational]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: Exposed on the dedicated metrics listener; low-cardinality labels only.
+      responses:
+        "200":
+          description: Prometheus exposition format
+          content:
+            text/plain: {}
+
+  /meetings/quick-create:
+    post:
+      tags: [meetings]
+      operationId: quickCreateMeeting
+      summary: Create an immediate (quick) meeting
+      description: >
+        Creates a type=quick, status=scheduled meeting and returns its
+        credentials. Idempotency: an explicit Idempotency-Key header takes
+        precedence over the implicit space_id+creator_uid+2s window; the same
+        key returns the first successful result even across two 2s windows, and
+        the same key with a different canonical payload returns
+        MEETING_IDEMPOTENCY_CONFLICT. Without an explicit key the implicit 2s
+        bucket applies.
+      parameters:
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/accept_language"
+        - $ref: "#/components/parameters/idempotency_key"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/quick_create_request" }
+      responses:
+        "200":
+          description: Meeting created (or idempotent replay of the first result)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_created_response" }
+        "409":
+          $ref: "#/components/responses/error"
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings:
+    post:
+      tags: [meetings]
+      operationId: scheduleMeeting
+      summary: Schedule a meeting
+      description: >
+        Creates a type=scheduled meeting. The scheduled_start_at is validated
+        against the server clock; an invalid time returns MEETING_TIME_INVALID.
+        The meeting number and join link are generated immediately.
+      parameters:
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/accept_language"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/schedule_request" }
+      responses:
+        "200":
+          description: Meeting scheduled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_created_response" }
+        default:
+          $ref: "#/components/responses/error"
+    get:
+      tags: [meetings]
+      operationId: listMeetings
+      summary: List meetings
+      description: >
+        Cursor-paginated list. Summaries expose only password_enabled and
+        join_link_available; a raw join link is never returned in list results.
+      parameters:
+        - $ref: "#/components/parameters/x_space_id"
+        - name: view
+          in: query
+          required: true
+          schema: { type: string, enum: [upcoming, history] }
+        - name: page_size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: page_token
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: A page of meeting summaries
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_list_response" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}:
+    parameters:
+      - $ref: "#/components/parameters/meeting_id"
+      - $ref: "#/components/parameters/x_space_id"
+    get:
+      tags: [meetings]
+      operationId: getMeeting
+      summary: Get meeting detail
+      description: >
+        Visible to the creator, invitees, participants, or an authorized
+        credential holder (post-evaluate). Never returns a plaintext password;
+        an unauthorized caller does not leak credentials.
+      responses:
+        "200":
+          description: Meeting detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_detail" }
+        default:
+          $ref: "#/components/responses/error"
+    patch:
+      tags: [meetings]
+      operationId: editMeeting
+      summary: Edit a scheduled meeting (creator/host, before live)
+      description: >
+        Requires If-Match with the current version. A stale version returns
+        MEETING_VERSION_CONFLICT. Changing the password after the meeting is live
+        returns MEETING_PASSWORD_IMMUTABLE.
+      parameters:
+        - $ref: "#/components/parameters/if_match"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/edit_request" }
+      responses:
+        "200":
+          description: Updated meeting summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_summary" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/cancel:
+    post:
+      tags: [meetings]
+      operationId: cancelMeeting
+      summary: Cancel a scheduled meeting (creator/host, before live)
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match_optional"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Meeting cancelled (idempotent)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_summary" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/admission/evaluate:
+    post:
+      tags: [admission]
+      operationId: evaluateAdmission
+      summary: Public admission evaluation
+      description: >
+        Resolves exactly one credential (meeting_id | meeting_number |
+        link_token), then applies the fixed FD-27 step-1 oracle inside the S-1
+        authorization envelope. An eligible caller receives password_required and
+        allowed_to_prejoin; an ineligible caller receives only a stable error and
+        never the meeting_id or password state. Unauthorized cross-Space guesses
+        collapse to MEETING_CREDENTIAL_INVALID (404).
+      parameters:
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/evaluate_request" }
+      responses:
+        "200":
+          description: Eligible; prejoin disposition returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/evaluate_response" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/password/verify:
+    post:
+      tags: [admission]
+      operationId: verifyPassword
+      summary: Verify a meeting password
+      description: >
+        Verifies the 6-digit password against a non-reversible verifier.
+        Attempts and cooldown are tracked per user+meeting; 1-4 wrong attempts
+        return MEETING_PASSWORD_INVALID, the 5th enters a cooldown
+        (MEETING_PASSWORD_COOLDOWN). A format failure returns
+        MEETING_PASSWORD_FORMAT_INVALID and does not count. On success a
+        short-lived password_pass_token is issued.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/password_verify_request" }
+      responses:
+        "200":
+          description: Password accepted; pass token issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/password_pass_response" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/admission/finalize:
+    post:
+      tags: [admission]
+      operationId: finalizeAdmission
+      summary: Final admission and LiveKit token issuance
+      description: >
+        Re-runs the full FD-27 step-1 oracle plus role and pass-token validity
+        before minting a LiveKit token. A quick meeting's first successful
+        finalize atomically sets it live. The password_pass_token is consumed
+        only on a successful token issuance; on MEETING_LIVEKIT_UNAVAILABLE or a
+        safe 5xx it stays valid within its TTL for replay. If a step-1 predicate
+        changed, the concrete step-1 error is returned; if the pass token TTL
+        expired, MEETING_PASSWORD_PASS_EXPIRED.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match_optional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/finalize_request" }
+      responses:
+        "200":
+          description: Admitted; LiveKit token issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/finalize_response" }
+        "503":
+          $ref: "#/components/responses/error"
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/participants/me/leave:
+    post:
+      tags: [controls]
+      operationId: leaveMeeting
+      summary: Leave the meeting (idempotent)
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participant_segment_id]
+              properties:
+                participant_segment_id: { type: string }
+      responses:
+        "200":
+          description: Segment terminal state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/participant_segment" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/participants/{uid}/role:
+    put:
+      tags: [controls]
+      operationId: setParticipantRole
+      summary: Set a participant role (host only)
+      description: The cohost may not assign or revoke cohost; only the host may.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/uid"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { type: string, enum: [C, M] }
+      responses:
+        "200":
+          description: Updated participant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/participant" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/controls/mute:
+    post:
+      tags: [controls]
+      operationId: muteParticipants
+      summary: Mute a participant or everyone (host/cohost)
+      description: A cohost may only operate on members; a member may unmute themselves.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                target_uid: { type: string }
+                all: { type: boolean }
+                participant_segment_id: { type: string }
+      responses:
+        "200":
+          description: Operation result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/operation_result" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/participants/{uid}:
+    delete:
+      tags: [controls]
+      operationId: removeParticipant
+      summary: Remove a participant (host/cohost)
+      description: >
+        Writes a terminal removal record that blocks future admission before the
+        password step.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/uid"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match_optional"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Removed participant
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/participant" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/lock:
+    put:
+      tags: [controls]
+      operationId: setLock
+      summary: Lock or unlock the meeting (host/cohost)
+      description: A lock rejects not-yet-in-room admissions; active users are unaffected.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [locked]
+              properties:
+                locked: { type: boolean }
+      responses:
+        "200":
+          description: Lock state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_summary" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/end:
+    post:
+      tags: [controls]
+      operationId: endMeeting
+      summary: End the meeting for everyone (host only)
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match_optional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        "200":
+          description: Meeting ended (idempotent)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/meeting_summary" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/share:
+    post:
+      tags: [controls]
+      operationId: startShare
+      summary: Start screen share
+      description: Rejected with MEETING_SHARE_CONFLICT when a holder is already active.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/share_request" }
+      responses:
+        "200":
+          description: Share holder
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/share_state" }
+        default:
+          $ref: "#/components/responses/error"
+    delete:
+      tags: [controls]
+      operationId: stopShare
+      summary: Stop screen share
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/share_request" }
+      responses:
+        "200":
+          description: Share state (empty holder)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/share_state" }
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/{meeting_id}/invites:
+    post:
+      tags: [controls]
+      operationId: inviteMembers
+      summary: Invite members (host/cohost)
+      description: >
+        A notification failure never rolls back the meeting change; affected
+        operations return MEETING_NOTIFICATION_DEFERRED as a non-blocking warning.
+      parameters:
+        - $ref: "#/components/parameters/meeting_id"
+        - $ref: "#/components/parameters/x_space_id"
+        - $ref: "#/components/parameters/if_match_optional"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [uid_list]
+              properties:
+                uid_list:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Invite statuses and any deferred notifications
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/invite_result" }
+        "202":
+          $ref: "#/components/responses/error"
+        default:
+          $ref: "#/components/responses/error"
+
+  /meetings/livekit/webhook:
+    post:
+      tags: [webhook]
+      operationId: livekitWebhook
+      summary: LiveKit webhook (reconciliation only)
+      description: >
+        Authenticated by LiveKit signature; used only to reconcile online/track
+        state. It is never the sole source of truth for meeting lifecycle.
+      responses:
+        "200":
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        default:
+          $ref: "#/components/responses/error"
+
+components:
+  parameters:
+    meeting_id:
+      name: meeting_id
+      in: path
+      required: true
+      schema: { type: string }
+    uid:
+      name: uid
+      in: path
+      required: true
+      schema: { type: string }
+    x_space_id:
+      name: X-Space-Id
+      in: header
+      required: true
+      description: Active Space id. Identity (uid/org) is resolved by the auth seam, never from client headers.
+      schema: { type: string }
+    accept_language:
+      name: Accept-Language
+      in: header
+      required: false
+      schema: { type: string }
+    idempotency_key:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Explicit idempotency key; takes precedence over the implicit 2s window.
+      schema: { type: string }
+    if_match:
+      name: If-Match
+      in: header
+      required: true
+      description: Current entity version for optimistic concurrency.
+      schema: { type: string }
+    if_match_optional:
+      name: If-Match
+      in: header
+      required: false
+      schema: { type: string }
+
+  responses:
+    error:
+      description: Stable error envelope (see errors.yaml for the code taxonomy).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/error_response" }
+
+  schemas:
+    readiness_response:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        degraded: { type: boolean }
+        dependencies:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [ok, unavailable]
+
+    error_response:
+      type: object
+      description: >
+        Shared error envelope for all endpoints (snake_case). `code` is a stable
+        value from errors.yaml; `details` carries only that code's safe keys and
+        never a secret.
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+        request_id: { type: string }
+
+    client_capabilities:
+      type: object
+      description: Client media/feature capabilities advertised at admission time.
+      properties:
+        screen_share: { type: boolean }
+        camera: { type: boolean }
+        microphone: { type: boolean }
+
+    reconnect_context:
+      type: object
+      description: Hints for same-endpoint reconnect grace evaluation.
+      properties:
+        prior_segment_id: { type: string }
+        device_id_hash: { type: string }
+
+    quick_create_request:
+      type: object
+      properties:
+        topic: { type: string }
+        password:
+          type: string
+          description: Optional 6-digit password; transported only, never persisted in plaintext.
+          pattern: "^[0-9]{6}$"
+        client_timezone: { type: string }
+        client_capabilities: { $ref: "#/components/schemas/client_capabilities" }
+
+    schedule_request:
+      type: object
+      required: [topic, scheduled_start_at, duration_minutes]
+      properties:
+        topic: { type: string }
+        scheduled_start_at: { type: string, format: date-time }
+        duration_minutes: { type: integer, minimum: 1 }
+        invitee_uids:
+          type: array
+          items: { type: string }
+        password: { type: string, pattern: "^[0-9]{6}$" }
+        client_timezone: { type: string }
+        client_capabilities: { $ref: "#/components/schemas/client_capabilities" }
+
+    edit_request:
+      type: object
+      properties:
+        topic: { type: string }
+        scheduled_start_at: { type: string, format: date-time }
+        duration_minutes: { type: integer, minimum: 1 }
+        invitee_delta:
+          type: object
+          properties:
+            add: { type: array, items: { type: string } }
+            remove: { type: array, items: { type: string } }
+        password_op:
+          type: object
+          description: Password mutation before live only.
+          properties:
+            action: { type: string, enum: [set, clear] }
+            password: { type: string, pattern: "^[0-9]{6}$" }
+
+    evaluate_request:
+      type: object
+      required: [source]
+      description: >
+        Exactly one of meeting_id / meeting_number / link_token must be present.
+      properties:
+        source: { type: string, enum: [list, number, link, rejoin] }
+        meeting_id: { type: string }
+        meeting_number: { type: string }
+        link_token: { type: string }
+        device_hints: { $ref: "#/components/schemas/reconnect_context" }
+        client_capabilities: { $ref: "#/components/schemas/client_capabilities" }
+        reconnect_context: { $ref: "#/components/schemas/reconnect_context" }
+
+    evaluate_response:
+      type: object
+      description: Only returned for an eligible, authorized caller.
+      required: [meeting_id, status, password_required, allowed_to_prejoin, version]
+      properties:
+        meeting_id: { type: string }
+        status: { $ref: "#/components/schemas/meeting_status" }
+        password_required: { type: boolean }
+        password_challenge_id: { type: string }
+        allowed_to_prejoin:
+          type: boolean
+          description: Equals eligible AND NOT password_required.
+        version: { type: integer }
+
+    password_verify_request:
+      type: object
+      required: [password, password_challenge_id]
+      properties:
+        password: { type: string, pattern: "^[0-9]{6}$" }
+        password_challenge_id: { type: string }
+        device_hints: { $ref: "#/components/schemas/reconnect_context" }
+
+    password_pass_response:
+      type: object
+      required: [password_pass_token, expires_at, version]
+      properties:
+        password_pass_token:
+          type: string
+          description: Short-lived, single-use-on-success token bound to user+meeting+challenge.
+        expires_at: { type: string, format: date-time }
+        version: { type: integer }
+
+    finalize_request:
+      type: object
+      required: [device_id_hash, client_capabilities]
+      properties:
+        password_pass_token: { type: string }
+        device_id_hash: { type: string }
+        client_capabilities: { $ref: "#/components/schemas/client_capabilities" }
+        reconnect_context: { $ref: "#/components/schemas/reconnect_context" }
+
+    finalize_response:
+      type: object
+      required: [livekit_url, livekit_token, participant_segment_id, role, version]
+      properties:
+        livekit_url: { type: string }
+        livekit_token:
+          type: string
+          description: Short-lived LiveKit access token; a secret, never logged.
+        participant_segment_id: { type: string }
+        role: { $ref: "#/components/schemas/role" }
+        version: { type: integer }
+
+    meeting_status:
+      type: string
+      enum: [scheduled, live, ended, cancelled]
+
+    meeting_type:
+      type: string
+      enum: [quick, scheduled]
+
+    role:
+      type: string
+      description: Host, Cohost, or Member.
+      enum: [H, C, M]
+
+    end_reason:
+      type: string
+      enum: [host_end, no_show, empty_timeout, system]
+
+    meeting_created_response:
+      type: object
+      required: [meeting_id, type, status, meeting_number, join_link, password_enabled, version]
+      properties:
+        meeting_id: { type: string }
+        type: { $ref: "#/components/schemas/meeting_type" }
+        status: { $ref: "#/components/schemas/meeting_status" }
+        meeting_number: { type: string }
+        join_link: { type: string }
+        password_enabled: { type: boolean }
+        version: { type: integer }
+
+    meeting_summary:
+      type: object
+      required: [meeting_id, type, status, password_enabled, version]
+      properties:
+        meeting_id: { type: string }
+        type: { $ref: "#/components/schemas/meeting_type" }
+        status: { $ref: "#/components/schemas/meeting_status" }
+        topic: { type: string }
+        scheduled_start_at: { type: string, format: date-time }
+        duration_minutes: { type: integer }
+        actual_start_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time }
+        end_reason: { $ref: "#/components/schemas/end_reason" }
+        locked: { type: boolean }
+        password_enabled: { type: boolean }
+        join_link_available: { type: boolean }
+        version: { type: integer }
+
+    meeting_detail:
+      allOf:
+        - $ref: "#/components/schemas/meeting_summary"
+        - type: object
+          properties:
+            creator_uid: { type: string }
+            host_uid: { type: string }
+            meeting_number: { type: string }
+            join_link:
+              type: string
+              description: Only returned to the creator/host or an invited member; omitted otherwise.
+            participants:
+              type: array
+              items: { $ref: "#/components/schemas/participant" }
+            invites:
+              type: array
+              items: { $ref: "#/components/schemas/invite" }
+
+    meeting_list_response:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/meeting_summary" }
+        next_page_token: { type: string }
+
+    participant:
+      type: object
+      required: [uid, role, aggregate_state]
+      properties:
+        uid: { type: string }
+        role: { $ref: "#/components/schemas/role" }
+        aggregate_state:
+          type: string
+          enum: [invited, joined, left, removed, superseded]
+        removed: { type: boolean }
+        first_joined_at: { type: string, format: date-time }
+        last_left_at: { type: string, format: date-time }
+        version: { type: integer }
+
+    participant_segment:
+      type: object
+      required: [segment_id, meeting_id, uid]
+      properties:
+        segment_id: { type: string }
+        meeting_id: { type: string }
+        uid: { type: string }
+        device_id_hash: { type: string }
+        join_at: { type: string, format: date-time }
+        leave_at: { type: string, format: date-time }
+        end_reason:
+          type: string
+          enum: [left, removed, superseded, disconnected, ended]
+        superseded_by_segment_id: { type: string }
+
+    invite:
+      type: object
+      required: [invitee_uid, status]
+      properties:
+        invitee_uid: { type: string }
+        status: { type: string, enum: [invited, cancelled] }
+        invited_by: { type: string }
+        version: { type: integer }
+
+    invite_result:
+      type: object
+      properties:
+        invites:
+          type: array
+          items: { $ref: "#/components/schemas/invite" }
+        deferred_notifications:
+          type: array
+          description: Recipients whose notification was deferred (see MEETING_NOTIFICATION_DEFERRED).
+          items: { type: string }
+
+    share_request:
+      type: object
+      required: [participant_segment_id, share_type]
+      properties:
+        participant_segment_id: { type: string }
+        share_type: { type: string, enum: [screen, window, tab] }
+
+    share_state:
+      type: object
+      properties:
+        holder_uid: { type: string }
+        share_type: { type: string, enum: [screen, window, tab] }
+        active: { type: boolean }
+
+    operation_result:
+      type: object
+      properties:
+        ok: { type: boolean }
+        version: { type: integer }

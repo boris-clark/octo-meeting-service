@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+/out/
+
+# Local environment and secrets
+.env
+*.local
+
+# SBOM / scan artifacts
+sbom.cdx.json
+gosec-report.*
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Stray binaries from `go build ./cmd/...`
+/worker
+/api
