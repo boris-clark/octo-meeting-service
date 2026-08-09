@@ -462,7 +462,15 @@ func (s *Service) Finalize(c *gin.Context) {
 	tok, err := s.Minter.MintAccess(room, segmentID, role, claims, s.now())
 	if err != nil {
 		if reservedHere {
-			_ = s.PassTokens.Release(ctx, req.PasswordPassToken)
+			// The reservation must be released so the still-valid token is
+			// immediately retryable across instances. A Release failure would
+			// otherwise leave the reservation held until its TTL, temporarily
+			// blocking retry — so propagate it as MEETING_INTERNAL rather than
+			// masking it behind the retryable 503.
+			if rerr := s.PassTokens.Release(ctx, req.PasswordPassToken); rerr != nil {
+				WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+				return
+			}
 		}
 		WriteError(c, merr.New(merr.LiveKitUnavailable, "The media service is temporarily unavailable.").
 			WithDetail("retry_after", 2))

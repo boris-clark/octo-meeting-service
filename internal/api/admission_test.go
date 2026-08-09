@@ -439,3 +439,68 @@ func TestVerifyPasswordAuthorizedReachesVerifier(t *testing.T) {
 			verifier.calls, cooldown.gets, tokens.issues)
 	}
 }
+
+// releaseFailTokens is a PassTokenStore whose Reserve succeeds but Release fails,
+// used to prove finalize surfaces a Release error as MEETING_INTERNAL on the
+// retryable LiveKit-failure path (XIN-1808).
+type releaseFailTokens struct {
+	releaseErr   error
+	releaseCalls int
+}
+
+func (releaseFailTokens) Issue(context.Context, string, string, time.Time) (string, error) {
+	return "tok", nil
+}
+func (releaseFailTokens) Valid(context.Context, string, string, string, time.Time) (bool, error) {
+	return true, nil
+}
+func (releaseFailTokens) ValidForUser(context.Context, string, string, time.Time) (bool, error) {
+	return true, nil
+}
+func (releaseFailTokens) Reserve(context.Context, string, string, string, time.Time) (bool, bool, error) {
+	return true, true, nil
+}
+func (releaseFailTokens) Commit(context.Context, string, string, string) error { return nil }
+func (r *releaseFailTokens) Release(context.Context, string) error {
+	r.releaseCalls++
+	return r.releaseErr
+}
+func (releaseFailTokens) Consume(context.Context, string) error { return nil }
+
+func TestFinalizeReleaseErrorIsInternal(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	store := repo.NewMemStore()
+	space := &fakeSpace{members: map[string]bool{"space-1|alice": true}}
+	tokens := &releaseFailTokens{releaseErr: errors.New("redis down")}
+	svc := &Service{
+		Store: store, Space: space, Cooldown: repo.NewMemCooldownStore(),
+		PassTokens: tokens, Verifier: repo.NewMemPasswordVerifier(),
+		Minter: fakeMinter{err: errors.New("livekit down")}, // force mint failure
+		Now:    func() time.Time { return now }, Cfg: DefaultConfig(),
+	}
+	auth := fakeAuth{byToken: map[string]*seams.Principal{"tok-alice": {UserID: "alice", OrgID: "space-1"}}}
+	e := gin.New()
+	v1 := e.Group("/v1")
+	v1.Use(RequestID(), Identity(auth))
+	svc.Register(v1)
+
+	// Password meeting owned by carol; alice holds a pass token (Valid=true).
+	store.AddMeeting(repo.Meeting{
+		MeetingID: "m", SpaceID: "space-1", Type: meeting.TypeQuick,
+		Status: meeting.StatusScheduled, CreatorUID: "carol", PasswordEnabled: true, Version: 1,
+	}, "111111", "")
+
+	h := &harness{engine: e}
+	rec := h.do(t, http.MethodPost, "/v1/meetings/m/admission/finalize", "tok-alice",
+		map[string]any{"password_pass_token": "tok", "device_id_hash": "dev1"}, nil)
+
+	// Reserve succeeded and mint failed, so Release was attempted and failed:
+	// the response must be MEETING_INTERNAL (500), NOT the retryable 503.
+	if rec.Code != http.StatusInternalServerError || decodeCode(t, rec) != "MEETING_INTERNAL" {
+		t.Fatalf("release error: got %d %s, want 500 MEETING_INTERNAL", rec.Code, decodeCode(t, rec))
+	}
+	if tokens.releaseCalls != 1 {
+		t.Fatalf("Release called %d times, want 1", tokens.releaseCalls)
+	}
+}
