@@ -23,6 +23,12 @@ type Deps struct {
 	Logger  *zap.Logger
 	Metrics *observability.Metrics
 	Health  *health.Registry
+	// V1Middlewares are applied to the versioned API group in order (e.g. request
+	// id then fail-closed identity).
+	V1Middlewares []gin.HandlerFunc
+	// RegisterV1 mounts domain routes on the versioned API group. Nil in the
+	// bootstrap leaves the group empty.
+	RegisterV1 func(rg *gin.RouterGroup)
 }
 
 // NewEngine builds the Gin engine with baseline middleware and operational
@@ -41,8 +47,15 @@ func NewEngine(d Deps) *gin.Engine {
 	e.GET("/healthz", d.Health.Liveness)
 	e.GET("/readyz", d.Health.Readiness)
 
-	// Versioned API group; intentionally empty in the bootstrap.
-	_ = e.Group(d.Config.HTTP.BasePath)
+	// Versioned API group. Middlewares (request id, fail-closed identity) apply
+	// to every domain route; the group is empty unless RegisterV1 is provided.
+	v1 := e.Group(d.Config.HTTP.BasePath)
+	for _, mw := range d.V1Middlewares {
+		v1.Use(mw)
+	}
+	if d.RegisterV1 != nil {
+		d.RegisterV1(v1)
+	}
 
 	return e
 }
