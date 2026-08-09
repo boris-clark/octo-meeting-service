@@ -13,3 +13,7 @@ gosec-report.*
 # Editor / OS
 .DS_Store
 *.swp
+
+# Stray binaries from `go build ./cmd/...`
+/worker
+/api
