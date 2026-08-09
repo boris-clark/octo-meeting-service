@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/meeting"
@@ -29,9 +30,27 @@ func NewMySQLStore(db *sql.DB, lookupSecret string) *MySQLStore {
 	return &MySQLStore{db: db, lookupSecret: []byte(lookupSecret)}
 }
 
-const meetingColumns = `meeting_id, space_id, type, status, creator_uid, host_uid,
-	scheduled_start_at, duration_minutes, actual_start_at, password_enabled, locked,
-	max_participants, version`
+// meetingSelectCols is the single source of truth for the meeting SELECT list,
+// in the exact order scanMeeting reads. meetingColumns renders it optionally
+// qualified by a table alias — the joined ByNumber/ByLink queries MUST qualify
+// (both meeting and meeting_credential expose meeting_id, so an unqualified list
+// is an ambiguous-column error).
+var meetingSelectCols = []string{
+	"meeting_id", "space_id", "type", "status", "creator_uid", "host_uid",
+	"scheduled_start_at", "duration_minutes", "actual_start_at", "password_enabled",
+	"locked", "max_participants", "version",
+}
+
+func meetingColumns(alias string) string {
+	if alias == "" {
+		return strings.Join(meetingSelectCols, ", ")
+	}
+	qualified := make([]string, len(meetingSelectCols))
+	for i, c := range meetingSelectCols {
+		qualified[i] = alias + "." + c
+	}
+	return strings.Join(qualified, ", ")
+}
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -75,13 +94,13 @@ func (s *MySQLStore) Resolve(ctx context.Context, kind repo.CredentialKind, valu
 	)
 	switch kind {
 	case repo.ByID:
-		query = `SELECT ` + meetingColumns + ` FROM meeting WHERE meeting_id = ? AND deleted_at IS NULL`
+		query = `SELECT ` + meetingColumns("") + ` FROM meeting WHERE meeting_id = ? AND deleted_at IS NULL`
 		arg = value
 	case repo.ByNumber:
 		if len(s.lookupSecret) == 0 {
 			return repo.Meeting{}, false, nil
 		}
-		query = `SELECT ` + meetingColumns + ` FROM meeting m
+		query = `SELECT ` + meetingColumns("m") + ` FROM meeting m
 			JOIN meeting_credential c ON c.meeting_id = m.meeting_id
 			WHERE c.number_lookup_hash = ? AND c.status = 'active' AND m.deleted_at IS NULL`
 		arg = s.lookupHash(value)
@@ -89,7 +108,7 @@ func (s *MySQLStore) Resolve(ctx context.Context, kind repo.CredentialKind, valu
 		if len(s.lookupSecret) == 0 {
 			return repo.Meeting{}, false, nil
 		}
-		query = `SELECT ` + meetingColumns + ` FROM meeting m
+		query = `SELECT ` + meetingColumns("m") + ` FROM meeting m
 			JOIN meeting_credential c ON c.meeting_id = m.meeting_id
 			WHERE c.link_token_lookup_hash = ? AND c.status = 'active' AND m.deleted_at IS NULL`
 		arg = s.lookupHash(value)
@@ -190,7 +209,7 @@ func (s *MySQLStore) StartLive(ctx context.Context, meetingID string, now time.T
 		}
 	}
 
-	m, err := scanMeeting(tx.QueryRowContext(ctx, `SELECT `+meetingColumns+` FROM meeting WHERE meeting_id = ?`, meetingID))
+	m, err := scanMeeting(tx.QueryRowContext(ctx, `SELECT `+meetingColumns("")+` FROM meeting WHERE meeting_id = ?`, meetingID))
 	if err != nil {
 		return repo.Meeting{}, fmt.Errorf("start live: reload: %w", err)
 	}
