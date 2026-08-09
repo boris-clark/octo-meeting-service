@@ -58,6 +58,11 @@ type Store interface {
 	// finalize, setting actual_start_at. It returns the updated record. It is a
 	// no-op returning the current record when already live.
 	StartLive(ctx context.Context, meetingID string, now time.Time) (Meeting, error)
+	// CreateMeeting persists a new meeting with its credential (and optional
+	// password verifier) under an idempotency guard. A duplicate idempotency key
+	// with the same payload returns the first result (replayed=true); a duplicate
+	// key with a different payload returns ErrIdempotencyConflict.
+	CreateMeeting(ctx context.Context, in CreateInput) (Meeting, bool, error)
 }
 
 // MemStore is an in-memory Store for tests.
@@ -70,6 +75,12 @@ type MemStore struct {
 	invitees     map[string]bool
 	participants map[string]bool
 	activeCount  map[string]int
+	idem         map[string]idemRecord
+}
+
+type idemRecord struct {
+	meetingID   string
+	fingerprint string
 }
 
 // NewMemStore builds an empty in-memory store.
@@ -82,6 +93,7 @@ func NewMemStore() *MemStore {
 		invitees:     map[string]bool{},
 		participants: map[string]bool{},
 		activeCount:  map[string]int{},
+		idem:         map[string]idemRecord{},
 	}
 }
 
@@ -185,4 +197,60 @@ func (m *MemStore) StartLive(_ context.Context, meetingID string, now time.Time)
 		rec.Version++
 	}
 	return *rec, nil
+}
+
+// VerifierInput carries the columns for a meeting_password_verifier row. The
+// Verifier field is the non-reversible encoded verifier (e.g. Argon2id PHC);
+// no raw password is ever included.
+type VerifierInput struct {
+	Algorithm  string
+	ParamsJSON string
+	SaltID     string
+	PepperRef  string
+	Verifier   string
+}
+
+// CreateInput is the payload for CreateMeeting. Number and LinkToken are the raw
+// credentials; the store derives their lookup hashes (so the hashing secret
+// stays in the store, matching Resolve). The *Ciphertext fields hold the
+// envelope-encrypted display material prepared by the caller.
+type CreateInput struct {
+	Meeting          Meeting
+	Number           string
+	LinkToken        string
+	NumberCiphertext []byte
+	LinkCiphertext   []byte
+	Verifier         *VerifierInput
+
+	IdempotencyScope   string
+	IdempotencyKey     string
+	PayloadFingerprint string
+}
+
+// CreateMeeting implements Store for the in-memory store.
+func (m *MemStore) CreateMeeting(_ context.Context, in CreateInput) (Meeting, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if in.IdempotencyKey != "" {
+		k := key(in.IdempotencyScope, in.IdempotencyKey)
+		if rec, ok := m.idem[k]; ok {
+			if rec.fingerprint != in.PayloadFingerprint {
+				return Meeting{}, false, ErrIdempotencyConflict
+			}
+			existing := m.byID[rec.meetingID]
+			return *existing, true, nil
+		}
+		m.idem[k] = idemRecord{meetingID: in.Meeting.MeetingID, fingerprint: in.PayloadFingerprint}
+	}
+
+	cp := in.Meeting
+	m.byID[cp.MeetingID] = &cp
+	if in.Number != "" {
+		m.byNumber[in.Number] = cp.MeetingID
+	}
+	if in.LinkToken != "" {
+		m.byLink[in.LinkToken] = cp.MeetingID
+	}
+	return cp, false, nil
 }

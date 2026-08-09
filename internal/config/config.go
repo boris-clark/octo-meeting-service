@@ -13,17 +13,19 @@ import (
 // Config is the fully-validated runtime configuration for both the API and
 // worker entrypoints.
 type Config struct {
-	Env        string           `mapstructure:"env"`
-	HTTP       HTTPConfig       `mapstructure:"http"`
-	MySQL      MySQLConfig      `mapstructure:"mysql"`
-	Redis      RedisConfig      `mapstructure:"redis"`
-	Worker     WorkerConfig     `mapstructure:"worker"`
-	Log        LogConfig        `mapstructure:"log"`
-	Seams      SeamsConfig      `mapstructure:"seams"`
-	LiveKit    LiveKitConfig    `mapstructure:"livekit"`
-	Credential CredentialConfig `mapstructure:"credential"`
-	Internal   InternalConfig   `mapstructure:"internal"`
-	Shutdown   ShutdownConfig   `mapstructure:"shutdown"`
+	Env           string           `mapstructure:"env"`
+	HTTP          HTTPConfig       `mapstructure:"http"`
+	MySQL         MySQLConfig      `mapstructure:"mysql"`
+	Redis         RedisConfig      `mapstructure:"redis"`
+	Worker        WorkerConfig     `mapstructure:"worker"`
+	Log           LogConfig        `mapstructure:"log"`
+	Seams         SeamsConfig      `mapstructure:"seams"`
+	LiveKit       LiveKitConfig    `mapstructure:"livekit"`
+	Credential    CredentialConfig `mapstructure:"credential"`
+	Password      PasswordConfig   `mapstructure:"password"`
+	Internal      InternalConfig   `mapstructure:"internal"`
+	PublicBaseURL string           `mapstructure:"public_base_url"`
+	Shutdown      ShutdownConfig   `mapstructure:"shutdown"`
 }
 
 // HTTPConfig controls the public HTTP listener. The service mounts its own
@@ -92,10 +94,19 @@ type LiveKitConfig struct {
 	TokenTTL  time.Duration `mapstructure:"token_ttl"`
 }
 
-// CredentialConfig holds the HMAC secret used to derive credential lookup
-// hashes (meeting number / link token). Empty disables number/link resolution.
+// CredentialConfig holds the secrets protecting meeting credentials: the HMAC
+// secret for at-rest lookup hashes and the envelope secret for display
+// ciphertext (a 32-byte AES-256 key is derived from EnvelopeKey). Empty
+// disables number/link resolution and meeting creation.
 type CredentialConfig struct {
 	LookupSecret string `mapstructure:"lookup_secret"`
+	EnvelopeKey  string `mapstructure:"envelope_key"`
+}
+
+// PasswordConfig holds the pepper reference mixed into the Argon2id verifier.
+// The pepper is never stored with the verifier.
+type PasswordConfig struct {
+	Pepper string `mapstructure:"pepper"`
 }
 
 // InternalConfig holds service-to-service credentials for seam calls.
@@ -176,8 +187,10 @@ func bindEnv(v *viper.Viper) {
 		"seams.notification.base_url", "seams.notification.timeout",
 		"seams.livekit.base_url", "seams.livekit.timeout",
 		"livekit.url", "livekit.api_key", "livekit.api_secret", "livekit.token_ttl",
-		"credential.lookup_secret",
+		"credential.lookup_secret", "credential.envelope_key",
+		"password.pepper",
 		"internal.service_token",
+		"public_base_url",
 		"shutdown.grace_period",
 	}
 	for _, k := range keys {

@@ -221,3 +221,113 @@ func (s *MySQLStore) StartLive(ctx context.Context, meetingID string, now time.T
 
 // compile-time assertion.
 var _ repo.Store = (*MySQLStore)(nil)
+
+// CreateMeeting implements repo.Store. It persists the meeting, its credential
+// (with store-derived HMAC lookup hashes), and an optional password verifier in
+// one transaction, guarded by the idempotency key.
+func (s *MySQLStore) CreateMeeting(ctx context.Context, in repo.CreateInput) (repo.Meeting, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return repo.Meeting{}, false, fmt.Errorf("create meeting: begin: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if in.IdempotencyKey != "" {
+		keyHash := s.lookupHash(in.IdempotencyScope + "|" + in.IdempotencyKey)
+		var fingerprint, resultRef string
+		err := tx.QueryRowContext(ctx,
+			`SELECT payload_fingerprint, result_ref FROM meeting_idempotency_key WHERE scope = ? AND key_hash = ?`,
+			in.IdempotencyScope, keyHash).Scan(&fingerprint, &resultRef)
+		switch {
+		case err == nil:
+			if fingerprint != in.PayloadFingerprint {
+				return repo.Meeting{}, false, repo.ErrIdempotencyConflict
+			}
+			m, rerr := scanMeeting(tx.QueryRowContext(ctx, `SELECT `+meetingColumns("")+` FROM meeting WHERE meeting_id = ?`, resultRef))
+			if rerr != nil {
+				return repo.Meeting{}, false, fmt.Errorf("create meeting: replay load: %w", rerr)
+			}
+			if cerr := tx.Commit(); cerr != nil {
+				return repo.Meeting{}, false, cerr
+			}
+			committed = true
+			return m, true, nil
+		case errors.Is(err, sql.ErrNoRows):
+			// fall through to insert
+		default:
+			return repo.Meeting{}, false, fmt.Errorf("create meeting: idem lookup: %w", err)
+		}
+	}
+
+	if err := s.insertMeeting(ctx, tx, in.Meeting); err != nil {
+		return repo.Meeting{}, false, err
+	}
+	if err := s.insertCredential(ctx, tx, in); err != nil {
+		return repo.Meeting{}, false, err
+	}
+	if in.Verifier != nil {
+		if err := s.insertVerifier(ctx, tx, in.Meeting.MeetingID, in.Meeting.CreatorUID, *in.Verifier); err != nil {
+			return repo.Meeting{}, false, err
+		}
+	}
+	if in.IdempotencyKey != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO meeting_idempotency_key (scope, key_hash, payload_fingerprint, result_ref, expires_at)
+			 VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 HOUR))`,
+			in.IdempotencyScope, s.lookupHash(in.IdempotencyScope+"|"+in.IdempotencyKey), in.PayloadFingerprint, in.Meeting.MeetingID); err != nil {
+			return repo.Meeting{}, false, fmt.Errorf("create meeting: idem insert: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return repo.Meeting{}, false, fmt.Errorf("create meeting: commit: %w", err)
+	}
+	committed = true
+	return in.Meeting, false, nil
+}
+
+func (s *MySQLStore) insertMeeting(ctx context.Context, tx *sql.Tx, m repo.Meeting) error {
+	var sched sql.NullTime
+	if !m.ScheduledStartAt.IsZero() {
+		sched = sql.NullTime{Time: m.ScheduledStartAt.UTC(), Valid: true}
+	}
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO meeting (meeting_id, space_id, type, status, creator_uid, host_uid,
+			scheduled_start_at, password_enabled, locked, max_participants, version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		m.MeetingID, m.SpaceID, string(m.Type), string(m.Status), m.CreatorUID, m.HostUID,
+		sched, m.PasswordEnabled, m.MaxParticipants, m.Version)
+	if err != nil {
+		return fmt.Errorf("create meeting: insert meeting: %w", err)
+	}
+	return nil
+}
+
+func (s *MySQLStore) insertCredential(ctx context.Context, tx *sql.Tx, in repo.CreateInput) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO meeting_credential (meeting_id, number_lookup_hash, number_display_ciphertext,
+			link_token_lookup_hash, link_token_ciphertext, status)
+		 VALUES (?, ?, ?, ?, ?, 'active')`,
+		in.Meeting.MeetingID, s.lookupHash(in.Number), in.NumberCiphertext,
+		s.lookupHash(in.LinkToken), in.LinkCiphertext)
+	if err != nil {
+		return fmt.Errorf("create meeting: insert credential: %w", err)
+	}
+	return nil
+}
+
+func (s *MySQLStore) insertVerifier(ctx context.Context, tx *sql.Tx, meetingID, createdBy string, v repo.VerifierInput) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO meeting_password_verifier (meeting_id, algorithm, params_json, salt_id, pepper_ref, verifier, status, created_by)
+		 VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`,
+		meetingID, v.Algorithm, v.ParamsJSON, v.SaltID, v.PepperRef, []byte(v.Verifier), createdBy)
+	if err != nil {
+		return fmt.Errorf("create meeting: insert verifier: %w", err)
+	}
+	return nil
+}

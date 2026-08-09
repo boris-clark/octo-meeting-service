@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/Jerry-Xin/octo-meeting-service/internal/credential"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/admission"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/meeting"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/merr"
@@ -33,6 +34,7 @@ type Config struct {
 	PassTokenTTL    time.Duration
 	Cooldown        password.Policy
 	LiveKitURL      string
+	MaxParticipants int
 }
 
 // DefaultConfig returns the approved defaults.
@@ -42,6 +44,7 @@ func DefaultConfig() Config {
 		ReconnectGrace:  meeting.DefaultReconnectGrace,
 		PassTokenTTL:    2 * time.Minute,
 		Cooldown:        password.DefaultPolicy(),
+		MaxParticipants: 100,
 	}
 }
 
@@ -55,6 +58,14 @@ type Service struct {
 	Minter     TokenMinter
 	Now        func() time.Time
 	Cfg        Config
+
+	// Credential/verifier collaborators for the create path.
+	Credentials   *credential.Minter
+	Argon         password.Argon2Params
+	Pepper        string
+	PublicBaseURL string
+	// NewID generates a fresh meeting id; overridable in tests.
+	NewID func() string
 }
 
 func (s *Service) now() time.Time {
@@ -67,9 +78,18 @@ func (s *Service) now() time.Time {
 // Register mounts the admission routes on the given (already identity-guarded)
 // router group.
 func (s *Service) Register(rg *gin.RouterGroup) {
+	rg.POST("/meetings/quick-create", s.QuickCreate)
+	rg.POST("/meetings", s.Schedule)
 	rg.POST("/meetings/admission/evaluate", s.Evaluate)
 	rg.POST("/meetings/:meeting_id/password/verify", s.VerifyPassword)
 	rg.POST("/meetings/:meeting_id/admission/finalize", s.Finalize)
+}
+
+func (s *Service) newID() string {
+	if s.NewID != nil {
+		return s.NewID()
+	}
+	return "mtg-" + randHex(12)
 }
 
 type evaluateRequest struct {

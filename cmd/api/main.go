@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -20,11 +21,12 @@ import (
 
 	"github.com/Jerry-Xin/octo-meeting-service/internal/api"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/config"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/credential"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/password"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/health"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/httpserver"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/livekit"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/observability"
-	"github.com/Jerry-Xin/octo-meeting-service/internal/repo"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/seams"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/seams/httpclient"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/storage"
@@ -38,6 +40,9 @@ var (
 
 // cooldownTTL bounds how long idle password-attempt state survives in Redis.
 const cooldownTTL = 10 * time.Minute
+
+// passTokenMaxTTL bounds how long pass-token keys linger in Redis.
+const passTokenMaxTTL = time.Hour
 
 func main() {
 	if err := run(); err != nil {
@@ -150,14 +155,35 @@ func buildService(cfg *config.Config, db *sql.DB, rc *redis.Client, logger *zap.
 	acfg.LiveKitURL = cfg.LiveKit.URL
 
 	return &api.Service{
-		Store:      storage.NewMySQLStore(db, cfg.Credential.LookupSecret),
-		Space:      httpclient.NewSpaceClient(seamOptions(cfg.Seams.Space, cfg.Internal.ServiceToken)),
-		Cooldown:   storage.NewRedisCooldownStore(rc, cooldownTTL),
-		PassTokens: repo.NewMemPassTokenStore(),
-		Verifier:   repo.NewMemPasswordVerifier(),
-		Minter:     buildMinter(cfg.LiveKit, logger),
-		Cfg:        acfg,
+		Store:         storage.NewMySQLStore(db, cfg.Credential.LookupSecret),
+		Space:         httpclient.NewSpaceClient(seamOptions(cfg.Seams.Space, cfg.Internal.ServiceToken)),
+		Cooldown:      storage.NewRedisCooldownStore(rc, cooldownTTL),
+		PassTokens:    storage.NewRedisPassTokenStore(rc, passTokenMaxTTL),
+		Verifier:      storage.NewMySQLPasswordVerifier(db, cfg.Password.Pepper),
+		Minter:        buildMinter(cfg.LiveKit, logger),
+		Cfg:           acfg,
+		Credentials:   buildCredentialMinter(cfg.Credential, logger),
+		Argon:         password.DefaultArgon2Params(),
+		Pepper:        cfg.Password.Pepper,
+		PublicBaseURL: cfg.PublicBaseURL,
 	}
+}
+
+// buildCredentialMinter derives the AES-256 envelope key from the configured
+// secret (via SHA-256) and builds the credential minter. It returns nil when the
+// credential secrets are unset, so meeting creation fails closed until configured.
+func buildCredentialMinter(cfg config.CredentialConfig, logger *zap.Logger) *credential.Minter {
+	if cfg.LookupSecret == "" || cfg.EnvelopeKey == "" {
+		logger.Warn("credential secrets not configured; meeting creation is disabled")
+		return nil
+	}
+	key := sha256.Sum256([]byte(cfg.EnvelopeKey))
+	m, err := credential.NewMinter([]byte(cfg.LookupSecret), key[:])
+	if err != nil {
+		logger.Warn("credential minter init failed; meeting creation is disabled", zap.Error(err))
+		return nil
+	}
+	return m
 }
 
 func seamOptions(ep config.SeamEndpoint, serviceToken string) httpclient.Options {

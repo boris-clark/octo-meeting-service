@@ -15,6 +15,10 @@ import (
 // ErrNotFound is returned when a record does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrIdempotencyConflict is returned when an idempotency key is reused with a
+// different payload.
+var ErrIdempotencyConflict = errors.New("idempotency conflict")
+
 // CooldownStore persists per-user+meeting password attempt state. The production
 // implementation is Redis-atomic on the hot path; the in-memory version backs
 // tests.
