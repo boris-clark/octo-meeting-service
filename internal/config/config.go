@@ -13,14 +13,17 @@ import (
 // Config is the fully-validated runtime configuration for both the API and
 // worker entrypoints.
 type Config struct {
-	Env      string         `mapstructure:"env"`
-	HTTP     HTTPConfig     `mapstructure:"http"`
-	MySQL    MySQLConfig    `mapstructure:"mysql"`
-	Redis    RedisConfig    `mapstructure:"redis"`
-	Worker   WorkerConfig   `mapstructure:"worker"`
-	Log      LogConfig      `mapstructure:"log"`
-	Seams    SeamsConfig    `mapstructure:"seams"`
-	Shutdown ShutdownConfig `mapstructure:"shutdown"`
+	Env        string           `mapstructure:"env"`
+	HTTP       HTTPConfig       `mapstructure:"http"`
+	MySQL      MySQLConfig      `mapstructure:"mysql"`
+	Redis      RedisConfig      `mapstructure:"redis"`
+	Worker     WorkerConfig     `mapstructure:"worker"`
+	Log        LogConfig        `mapstructure:"log"`
+	Seams      SeamsConfig      `mapstructure:"seams"`
+	LiveKit    LiveKitConfig    `mapstructure:"livekit"`
+	Credential CredentialConfig `mapstructure:"credential"`
+	Internal   InternalConfig   `mapstructure:"internal"`
+	Shutdown   ShutdownConfig   `mapstructure:"shutdown"`
 }
 
 // HTTPConfig controls the public HTTP listener. The service mounts its own
@@ -64,8 +67,8 @@ type LogConfig struct {
 }
 
 // SeamsConfig holds the endpoints for external systems the service integrates
-// with. Clients are wired as interfaces only in the bootstrap; no live calls
-// are made yet.
+// with (auth/Space/notification verify seams and the LiveKit control plane).
+// The API entrypoint builds fail-closed HTTP clients from these endpoints.
 type SeamsConfig struct {
 	Auth         SeamEndpoint `mapstructure:"auth"`
 	Space        SeamEndpoint `mapstructure:"space"`
@@ -77,6 +80,27 @@ type SeamsConfig struct {
 type SeamEndpoint struct {
 	BaseURL string        `mapstructure:"base_url"`
 	Timeout time.Duration `mapstructure:"timeout"`
+}
+
+// LiveKitConfig holds the LiveKit control-plane credentials used to mint access
+// tokens. Empty API key/secret leaves token minting unavailable (finalize then
+// returns MEETING_LIVEKIT_UNAVAILABLE) rather than minting an invalid token.
+type LiveKitConfig struct {
+	URL       string        `mapstructure:"url"`
+	APIKey    string        `mapstructure:"api_key"`
+	APISecret string        `mapstructure:"api_secret"`
+	TokenTTL  time.Duration `mapstructure:"token_ttl"`
+}
+
+// CredentialConfig holds the HMAC secret used to derive credential lookup
+// hashes (meeting number / link token). Empty disables number/link resolution.
+type CredentialConfig struct {
+	LookupSecret string `mapstructure:"lookup_secret"`
+}
+
+// InternalConfig holds service-to-service credentials for seam calls.
+type InternalConfig struct {
+	ServiceToken string `mapstructure:"service_token"`
 }
 
 // ShutdownConfig controls graceful shutdown timing shared by both entrypoints.
@@ -128,6 +152,10 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("worker.poll_backoff", "2s")
 	v.SetDefault("log.level", "info")
 	v.SetDefault("log.format", "json")
+	v.SetDefault("seams.auth.timeout", "3s")
+	v.SetDefault("seams.space.timeout", "3s")
+	v.SetDefault("seams.notification.timeout", "3s")
+	v.SetDefault("livekit.token_ttl", "90s")
 	v.SetDefault("shutdown.grace_period", "20s")
 }
 
@@ -147,6 +175,9 @@ func bindEnv(v *viper.Viper) {
 		"seams.space.base_url", "seams.space.timeout",
 		"seams.notification.base_url", "seams.notification.timeout",
 		"seams.livekit.base_url", "seams.livekit.timeout",
+		"livekit.url", "livekit.api_key", "livekit.api_secret", "livekit.token_ttl",
+		"credential.lookup_secret",
+		"internal.service_token",
 		"shutdown.grace_period",
 	}
 	for _, k := range keys {

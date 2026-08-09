@@ -249,6 +249,35 @@ func (s *Service) VerifyPassword(c *gin.Context) {
 		return
 	}
 	meetingID := c.Param("meeting_id")
+	ctx := c.Request.Context()
+
+	// Security gate FIRST (blocker XIN-1803): resolve the meeting and apply the
+	// same S-1/FD-27 oracle as evaluate/finalize BEFORE the body is parsed or the
+	// verifier, cooldown, or pass-token store is touched. An unauthorized
+	// cross-Space guess therefore gets an indistinguishable 404 and never learns
+	// whether the meeting exists, is password-protected, or whether a password is
+	// valid — closing the enumeration/oracle hole.
+	m, found, err := s.Store.Resolve(ctx, repo.ByID, meetingID)
+	if err != nil {
+		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+		return
+	}
+	if !found {
+		WriteError(c, merr.New(merr.CredentialInvalid, "The meeting number or link is invalid."))
+		return
+	}
+	mf, cf, err := s.facts(ctx, m, p.UserID, p.OrgID, false)
+	if err != nil {
+		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+		return
+	}
+	if d := admission.Evaluate(mf, cf); !d.Eligible {
+		WriteError(c, s.decisionError(d.Error, m))
+		return
+	}
+
+	// Authorized to know the meeting exists: only now is it safe to parse the
+	// password body and interact with the verifier/cooldown/pass-token stores.
 	var req passwordVerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		WriteError(c, password.CheckFormat("")) // malformed body -> format error, not counted
@@ -259,7 +288,6 @@ func (s *Service) VerifyPassword(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
 	state, err := s.Cooldown.Get(ctx, meetingID, p.UserID)
 	if err != nil {
 		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))

@@ -1,0 +1,204 @@
+package storage
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/meeting"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/repo"
+)
+
+// MySQLStore is the MySQL-backed implementation of repo.Store. All queries are
+// parameterized. Credential resolution by meeting number / link token uses an
+// HMAC lookup hash so the raw credential is never used as an index or stored in
+// the clear. The DSN must enable time parsing (parseTime=true&loc=UTC).
+type MySQLStore struct {
+	db           *sql.DB
+	lookupSecret []byte
+}
+
+// NewMySQLStore builds a store. An empty lookupSecret disables number/link
+// resolution (those lookups return not-found) rather than computing an
+// attacker-influenced hash with a zero key.
+func NewMySQLStore(db *sql.DB, lookupSecret string) *MySQLStore {
+	return &MySQLStore{db: db, lookupSecret: []byte(lookupSecret)}
+}
+
+const meetingColumns = `meeting_id, space_id, type, status, creator_uid, host_uid,
+	scheduled_start_at, duration_minutes, actual_start_at, password_enabled, locked,
+	max_participants, version`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMeeting(row rowScanner) (repo.Meeting, error) {
+	var (
+		m            repo.Meeting
+		typ, status  string
+		schedStart   sql.NullTime
+		durationMins sql.NullInt64
+		actualStart  sql.NullTime
+		passwordEn   bool
+		locked       bool
+	)
+	if err := row.Scan(
+		&m.MeetingID, &m.SpaceID, &typ, &status, &m.CreatorUID, &m.HostUID,
+		&schedStart, &durationMins, &actualStart, &passwordEn, &locked,
+		&m.MaxParticipants, &m.Version,
+	); err != nil {
+		return repo.Meeting{}, err
+	}
+	m.Type = meeting.Type(typ)
+	m.Status = meeting.Status(status)
+	m.PasswordEnabled = passwordEn
+	m.Locked = locked
+	if schedStart.Valid {
+		m.ScheduledStartAt = schedStart.Time.UTC()
+	}
+	if actualStart.Valid {
+		m.ActualStartAt = actualStart.Time.UTC()
+	}
+	return m, nil
+}
+
+// Resolve implements repo.Store.
+func (s *MySQLStore) Resolve(ctx context.Context, kind repo.CredentialKind, value string) (repo.Meeting, bool, error) {
+	var (
+		query string
+		arg   any
+	)
+	switch kind {
+	case repo.ByID:
+		query = `SELECT ` + meetingColumns + ` FROM meeting WHERE meeting_id = ? AND deleted_at IS NULL`
+		arg = value
+	case repo.ByNumber:
+		if len(s.lookupSecret) == 0 {
+			return repo.Meeting{}, false, nil
+		}
+		query = `SELECT ` + meetingColumns + ` FROM meeting m
+			JOIN meeting_credential c ON c.meeting_id = m.meeting_id
+			WHERE c.number_lookup_hash = ? AND c.status = 'active' AND m.deleted_at IS NULL`
+		arg = s.lookupHash(value)
+	case repo.ByLink:
+		if len(s.lookupSecret) == 0 {
+			return repo.Meeting{}, false, nil
+		}
+		query = `SELECT ` + meetingColumns + ` FROM meeting m
+			JOIN meeting_credential c ON c.meeting_id = m.meeting_id
+			WHERE c.link_token_lookup_hash = ? AND c.status = 'active' AND m.deleted_at IS NULL`
+		arg = s.lookupHash(value)
+	default:
+		return repo.Meeting{}, false, fmt.Errorf("unknown credential kind %q", kind)
+	}
+
+	m, err := scanMeeting(s.db.QueryRowContext(ctx, query, arg))
+	if errors.Is(err, sql.ErrNoRows) {
+		return repo.Meeting{}, false, nil
+	}
+	if err != nil {
+		return repo.Meeting{}, false, fmt.Errorf("resolve meeting: %w", err)
+	}
+	return m, true, nil
+}
+
+func (s *MySQLStore) lookupHash(value string) []byte {
+	mac := hmac.New(sha256.New, s.lookupSecret)
+	mac.Write([]byte(value))
+	return mac.Sum(nil)
+}
+
+// ActiveParticipantCount implements repo.Store. Active = a segment that has not
+// left and has not been superseded (the authoritative full/empty count).
+func (s *MySQLStore) ActiveParticipantCount(ctx context.Context, meetingID string) (int, error) {
+	const q = `SELECT COUNT(*) FROM meeting_participant_segment
+		WHERE meeting_id = ? AND leave_at IS NULL AND superseded_by_segment_id IS NULL`
+	var n int
+	if err := s.db.QueryRowContext(ctx, q, meetingID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("active participant count: %w", err)
+	}
+	return n, nil
+}
+
+// IsRemoved implements repo.Store.
+func (s *MySQLStore) IsRemoved(ctx context.Context, meetingID, uid string) (bool, error) {
+	const q = `SELECT removed FROM meeting_participant WHERE meeting_id = ? AND uid = ?`
+	var removed bool
+	err := s.db.QueryRowContext(ctx, q, meetingID, uid).Scan(&removed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("is removed: %w", err)
+	}
+	return removed, nil
+}
+
+// IsInvitee implements repo.Store.
+func (s *MySQLStore) IsInvitee(ctx context.Context, meetingID, uid string) (bool, error) {
+	const q = `SELECT 1 FROM meeting_invite WHERE meeting_id = ? AND invitee_uid = ? AND status = 'invited'`
+	return s.exists(ctx, q, meetingID, uid)
+}
+
+// IsParticipant implements repo.Store.
+func (s *MySQLStore) IsParticipant(ctx context.Context, meetingID, uid string) (bool, error) {
+	const q = `SELECT 1 FROM meeting_participant WHERE meeting_id = ? AND uid = ?`
+	return s.exists(ctx, q, meetingID, uid)
+}
+
+func (s *MySQLStore) exists(ctx context.Context, query string, args ...any) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("exists check: %w", err)
+	}
+	return true, nil
+}
+
+// StartLive implements repo.Store. It atomically transitions a scheduled meeting
+// to live on first finalize under a row lock, and is a no-op returning the
+// current record when already live.
+func (s *MySQLStore) StartLive(ctx context.Context, meetingID string, now time.Time) (repo.Meeting, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return repo.Meeting{}, fmt.Errorf("start live: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var status string
+	err = tx.QueryRowContext(ctx, `SELECT status FROM meeting WHERE meeting_id = ? FOR UPDATE`, meetingID).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return repo.Meeting{}, repo.ErrNotFound
+	}
+	if err != nil {
+		return repo.Meeting{}, fmt.Errorf("start live: lock: %w", err)
+	}
+
+	if meeting.Status(status) == meeting.StatusScheduled {
+		const upd = `UPDATE meeting SET status = 'live', actual_start_at = ?, version = version + 1,
+			updated_at = CURRENT_TIMESTAMP(3) WHERE meeting_id = ?`
+		if _, err := tx.ExecContext(ctx, upd, now.UTC(), meetingID); err != nil {
+			return repo.Meeting{}, fmt.Errorf("start live: update: %w", err)
+		}
+	}
+
+	m, err := scanMeeting(tx.QueryRowContext(ctx, `SELECT `+meetingColumns+` FROM meeting WHERE meeting_id = ?`, meetingID))
+	if err != nil {
+		return repo.Meeting{}, fmt.Errorf("start live: reload: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return repo.Meeting{}, fmt.Errorf("start live: commit: %w", err)
+	}
+	return m, nil
+}
+
+// compile-time assertion.
+var _ repo.Store = (*MySQLStore)(nil)

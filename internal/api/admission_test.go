@@ -300,3 +300,133 @@ func TestDefaultConfigPolicy(t *testing.T) {
 		t.Fatal("default cooldown policy not set")
 	}
 }
+
+// --- blocker XIN-1803: VerifyPassword must gate before touching stores ---
+
+// counting spies assert that the verifier/cooldown/pass-token stores are NOT
+// touched when an unauthorized caller hits password/verify.
+type spyCooldown struct {
+	inner      repo.CooldownStore
+	gets, puts int
+}
+
+func (s *spyCooldown) Get(ctx context.Context, m, u string) (password.State, error) {
+	s.gets++
+	return s.inner.Get(ctx, m, u)
+}
+func (s *spyCooldown) Put(ctx context.Context, m, u string, st password.State) error {
+	s.puts++
+	return s.inner.Put(ctx, m, u, st)
+}
+
+type spyVerifier struct {
+	inner repo.PasswordVerifier
+	calls int
+}
+
+func (s *spyVerifier) Verify(ctx context.Context, m, raw string) (bool, error) {
+	s.calls++
+	return s.inner.Verify(ctx, m, raw)
+}
+
+type spyPassTokens struct {
+	inner  repo.PassTokenStore
+	issues int
+}
+
+func (s *spyPassTokens) Issue(ctx context.Context, m, u string, exp time.Time) (string, error) {
+	s.issues++
+	return s.inner.Issue(ctx, m, u, exp)
+}
+func (s *spyPassTokens) Valid(ctx context.Context, t, m, u string, now time.Time) (bool, error) {
+	return s.inner.Valid(ctx, t, m, u, now)
+}
+func (s *spyPassTokens) ValidForUser(ctx context.Context, m, u string, now time.Time) (bool, error) {
+	return s.inner.ValidForUser(ctx, m, u, now)
+}
+func (s *spyPassTokens) Consume(ctx context.Context, t string) error {
+	return s.inner.Consume(ctx, t)
+}
+
+func newSpyHarness(t *testing.T) (*harness, *spyCooldown, *spyVerifier, *spyPassTokens) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	store := repo.NewMemStore()
+	space := &fakeSpace{members: map[string]bool{}}
+	memVerifier := repo.NewMemPasswordVerifier()
+	verifier := &spyVerifier{inner: memVerifier}
+	cooldown := &spyCooldown{inner: repo.NewMemCooldownStore()}
+	tokens := &spyPassTokens{inner: repo.NewMemPassTokenStore()}
+	svc := &Service{
+		Store: store, Space: space, Cooldown: cooldown, PassTokens: tokens,
+		Verifier: verifier, Minter: fakeMinter{token: "lk"},
+		Now: func() time.Time { return time.Unix(1_760_000_000, 0).UTC() }, Cfg: DefaultConfig(),
+	}
+	auth := fakeAuth{byToken: map[string]*seams.Principal{
+		"tok-alice": {UserID: "alice", OrgID: "space-1"},
+		"tok-bob":   {UserID: "bob", OrgID: "space-2"},
+	}}
+	e := gin.New()
+	v1 := e.Group("/v1")
+	v1.Use(RequestID(), Identity(auth))
+	svc.Register(v1)
+	return &harness{engine: e, store: store, space: space, verifier: memVerifier, svc: svc}, cooldown, verifier, tokens
+}
+
+func TestVerifyPasswordUnauthorizedIsIndistinguishable404(t *testing.T) {
+	h, cooldown, verifier, tokens := newSpyHarness(t)
+	// Password-protected meeting in space-1; bob (space-2, not creator/invitee/
+	// participant) is unauthorized to know it exists.
+	h.store.AddMeeting(repo.Meeting{
+		MeetingID: "secret", SpaceID: "space-1", Type: meeting.TypeQuick,
+		Status: meeting.StatusScheduled, CreatorUID: "alice", PasswordEnabled: true, Version: 1,
+	}, "999999", "")
+
+	rec := h.do(t, http.MethodPost, "/v1/meetings/secret/password/verify", "tok-bob",
+		map[string]any{"password": "123456", "password_challenge_id": "c"}, nil)
+
+	// Indistinguishable from a non-existent meeting.
+	if rec.Code != http.StatusNotFound || decodeCode(t, rec) != "MEETING_CREDENTIAL_INVALID" {
+		t.Fatalf("unauthorized verify: got %d %s, want 404 MEETING_CREDENTIAL_INVALID", rec.Code, decodeCode(t, rec))
+	}
+
+	// A verify against a meeting that does not exist at all returns the same.
+	rec2 := h.do(t, http.MethodPost, "/v1/meetings/nope/password/verify", "tok-bob",
+		map[string]any{"password": "123456", "password_challenge_id": "c"}, nil)
+	if rec2.Code != rec.Code || decodeCode(t, rec2) != decodeCode(t, rec) {
+		t.Fatalf("existent-vs-nonexistent distinguishable: %d/%s vs %d/%s",
+			rec.Code, decodeCode(t, rec), rec2.Code, decodeCode(t, rec2))
+	}
+
+	// Crucially, no verifier/cooldown/pass-token interaction occurred.
+	if verifier.calls != 0 {
+		t.Errorf("verifier touched %d times for unauthorized caller", verifier.calls)
+	}
+	if cooldown.gets != 0 || cooldown.puts != 0 {
+		t.Errorf("cooldown touched (gets=%d puts=%d) for unauthorized caller", cooldown.gets, cooldown.puts)
+	}
+	if tokens.issues != 0 {
+		t.Errorf("pass token issued %d times for unauthorized caller", tokens.issues)
+	}
+}
+
+func TestVerifyPasswordAuthorizedReachesVerifier(t *testing.T) {
+	h, cooldown, verifier, tokens := newSpyHarness(t)
+	h.space.members["space-1|alice"] = true
+	h.store.AddMeeting(repo.Meeting{
+		MeetingID: "m", SpaceID: "space-1", Type: meeting.TypeQuick,
+		Status: meeting.StatusScheduled, CreatorUID: "carol", PasswordEnabled: true, Version: 1,
+	}, "111111", "")
+	h.store.SetParticipant("m", "alice") // authorized to know it exists
+	h.verifier.Set("m", "424242")
+
+	rec := h.do(t, http.MethodPost, "/v1/meetings/m/password/verify", "tok-alice",
+		map[string]any{"password": "424242", "password_challenge_id": "c"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorized verify: got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if verifier.calls != 1 || cooldown.gets != 1 || tokens.issues != 1 {
+		t.Fatalf("authorized path did not exercise stores: verifier=%d cooldown.gets=%d issues=%d",
+			verifier.calls, cooldown.gets, tokens.issues)
+	}
+}

@@ -1,22 +1,32 @@
 // Command api is the HTTP entrypoint for the Octo Meeting service. It boots the
-// operational surface (health, readiness, metrics) and an empty versioned API
-// group; meeting domain routes are added later.
+// operational surface (health, readiness, metrics) and mounts the versioned
+// meeting API — request-id + fail-closed identity middleware plus the admission
+// routes — backed by the MySQL store, Redis cooldown, seam HTTP clients, and the
+// LiveKit minter.
 package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/Jerry-Xin/octo-meeting-service/internal/api"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/config"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/health"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/httpserver"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/livekit"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/observability"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/repo"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/seams"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/seams/httpclient"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/storage"
 )
 
@@ -25,6 +35,9 @@ var (
 	version = "dev"
 	commit  = "none"
 )
+
+// cooldownTTL bounds how long idle password-attempt state survives in Redis.
+const cooldownTTL = 10 * time.Minute
 
 func main() {
 	if err := run(); err != nil {
@@ -66,12 +79,12 @@ func run() error {
 	readiness.Register(storage.MySQLChecker{DB: db})
 	readiness.Register(storage.RedisChecker{Client: redisClient})
 
-	engine := httpserver.NewEngine(httpserver.Deps{
-		Config:  cfg,
-		Logger:  logger,
-		Metrics: metrics,
-		Health:  readiness,
-	})
+	// Build the admission service from real collaborators and the fail-closed
+	// auth seam used by the identity middleware.
+	svc := buildService(cfg, db, redisClient, logger)
+	auth := httpclient.NewAuthClient(seamOptions(cfg.Seams.Auth, cfg.Internal.ServiceToken))
+
+	engine := newAPIEngine(cfg, metrics, readiness, svc, auth)
 
 	apiSrv := httpserver.NewHTTPServer(cfg.HTTP, engine)
 	metricsSrv := &http.Server{
@@ -111,4 +124,68 @@ func run() error {
 		logger.Error("metrics shutdown", zap.Error(err))
 	}
 	return nil
+}
+
+// newAPIEngine assembles the gin engine with the operational surface plus the
+// versioned API group guarded by request-id and fail-closed identity middleware,
+// with the admission routes registered. This is the single wiring path used by
+// both the running binary and the router test, so the test proves the real
+// entrypoint exposes admission routes under the configured base path.
+func newAPIEngine(cfg *config.Config, metrics *observability.Metrics, readiness *health.Registry, svc *api.Service, auth seams.Auth) *gin.Engine {
+	return httpserver.NewEngine(httpserver.Deps{
+		Config:        cfg,
+		Metrics:       metrics,
+		Health:        readiness,
+		V1Middlewares: []gin.HandlerFunc{api.RequestID(), api.Identity(auth)},
+		RegisterV1:    svc.Register,
+	})
+}
+
+// buildService constructs the admission service from real collaborators. The
+// meeting store is MySQL-backed and the cooldown hot path is Redis-backed; the
+// pass-token and password-verifier stores remain in-memory this milestone (their
+// durable backings land with the create/credential subsystem).
+func buildService(cfg *config.Config, db *sql.DB, rc *redis.Client, logger *zap.Logger) *api.Service {
+	acfg := api.DefaultConfig()
+	acfg.LiveKitURL = cfg.LiveKit.URL
+
+	return &api.Service{
+		Store:      storage.NewMySQLStore(db, cfg.Credential.LookupSecret),
+		Space:      httpclient.NewSpaceClient(seamOptions(cfg.Seams.Space, cfg.Internal.ServiceToken)),
+		Cooldown:   storage.NewRedisCooldownStore(rc, cooldownTTL),
+		PassTokens: repo.NewMemPassTokenStore(),
+		Verifier:   repo.NewMemPasswordVerifier(),
+		Minter:     buildMinter(cfg.LiveKit, logger),
+		Cfg:        acfg,
+	}
+}
+
+func seamOptions(ep config.SeamEndpoint, serviceToken string) httpclient.Options {
+	return httpclient.Options{
+		BaseURL:      ep.BaseURL,
+		ServiceToken: serviceToken,
+		HTTPClient:   &http.Client{Timeout: ep.Timeout},
+	}
+}
+
+// buildMinter returns a LiveKit token minter, or an always-unavailable minter
+// when credentials are not configured so finalize fails closed with
+// MEETING_LIVEKIT_UNAVAILABLE rather than issuing an invalid token.
+func buildMinter(cfg config.LiveKitConfig, logger *zap.Logger) api.TokenMinter {
+	if cfg.APIKey == "" || cfg.APISecret == "" {
+		logger.Warn("livekit credentials not configured; finalize will report media unavailable")
+		return unavailableMinter{}
+	}
+	m, err := livekit.NewMinter(cfg.APIKey, cfg.APISecret, cfg.TokenTTL)
+	if err != nil {
+		logger.Warn("livekit minter init failed; finalize will report media unavailable", zap.Error(err))
+		return unavailableMinter{}
+	}
+	return api.LiveKitMinter{M: m}
+}
+
+type unavailableMinter struct{}
+
+func (unavailableMinter) MintAccess(_, _, _ string, _ map[string]string, _ time.Time) (string, error) {
+	return "", errors.New("livekit not configured")
 }
