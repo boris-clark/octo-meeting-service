@@ -80,6 +80,7 @@ func (s *Service) now() time.Time {
 func (s *Service) Register(rg *gin.RouterGroup) {
 	rg.POST("/meetings/quick-create", s.QuickCreate)
 	rg.POST("/meetings", s.Schedule)
+	rg.PATCH("/meetings/:meeting_id", s.Edit)
 	rg.POST("/meetings/admission/evaluate", s.Evaluate)
 	rg.POST("/meetings/:meeting_id/password/verify", s.VerifyPassword)
 	rg.POST("/meetings/:meeting_id/admission/finalize", s.Finalize)

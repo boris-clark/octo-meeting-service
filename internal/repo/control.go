@@ -124,3 +124,26 @@ func (m *MemStore) ShareHolder(_ context.Context, meetingID string) (string, err
 	defer m.mu.Unlock()
 	return m.shareHolder[meetingID], nil
 }
+
+// EditScheduled implements Store. Topic/duration are not part of the in-memory
+// Meeting projection, so the mem store applies the time and password-enabled
+// changes and always bumps the version; the MySQL store persists all fields.
+func (m *MemStore) EditScheduled(_ context.Context, meetingID string, in EditInput, ifMatch int64) (Meeting, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, err := m.versioned(meetingID, ifMatch)
+	if err != nil {
+		return Meeting{}, err
+	}
+	if rec.Status != meeting.StatusScheduled {
+		return Meeting{}, ErrInvalidTransition
+	}
+	if in.ScheduledStart != nil {
+		rec.ScheduledStartAt = in.ScheduledStart.UTC()
+	}
+	if in.Password != nil {
+		rec.PasswordEnabled = !in.Password.Clear
+	}
+	rec.Version++
+	return *rec, nil
+}

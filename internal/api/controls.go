@@ -14,14 +14,15 @@ import (
 
 // controlResponse is the compact summary returned by control mutations.
 type controlResponse struct {
-	MeetingID string `json:"meeting_id"`
-	Status    string `json:"status"`
-	Locked    bool   `json:"locked"`
-	Version   int64  `json:"version"`
+	MeetingID       string `json:"meeting_id"`
+	Status          string `json:"status"`
+	Locked          bool   `json:"locked"`
+	PasswordEnabled bool   `json:"password_enabled"`
+	Version         int64  `json:"version"`
 }
 
 func summaryOf(m repo.Meeting) controlResponse {
-	return controlResponse{MeetingID: m.MeetingID, Status: string(m.Status), Locked: m.Locked, Version: m.Version}
+	return controlResponse{MeetingID: m.MeetingID, Status: string(m.Status), Locked: m.Locked, PasswordEnabled: m.PasswordEnabled, Version: m.Version}
 }
 
 // ifMatch parses the optional If-Match version header (0 = no check).

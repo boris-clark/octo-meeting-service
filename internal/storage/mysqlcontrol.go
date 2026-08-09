@@ -199,3 +199,66 @@ func (s *MySQLStore) inTx(ctx context.Context, meetingID string, fn func(tx *sql
 	committed = true
 	return m, nil
 }
+
+// EditScheduled implements repo.Store. It applies topic/time/duration and/or a
+// before-live password change to a scheduled meeting inside a row-locked
+// transaction under the optimistic version check.
+func (s *MySQLStore) EditScheduled(ctx context.Context, meetingID string, in repo.EditInput, ifMatch int64) (repo.Meeting, error) {
+	return s.inTx(ctx, meetingID, func(tx *sql.Tx) error {
+		status, _, err := lockAndCheckVersion(ctx, tx, meetingID, ifMatch)
+		if err != nil {
+			return err
+		}
+		if status != meeting.StatusScheduled {
+			return repo.ErrInvalidTransition
+		}
+		if in.Topic != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE meeting SET topic=? WHERE meeting_id=?`, *in.Topic, meetingID); err != nil {
+				return err
+			}
+		}
+		if in.ScheduledStart != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE meeting SET scheduled_start_at=? WHERE meeting_id=?`, in.ScheduledStart.UTC(), meetingID); err != nil {
+				return err
+			}
+		}
+		if in.DurationMinutes != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE meeting SET duration_minutes=? WHERE meeting_id=?`, *in.DurationMinutes, meetingID); err != nil {
+				return err
+			}
+		}
+		if in.Password != nil {
+			if err := applyPasswordOp(ctx, tx, meetingID, in.Password); err != nil {
+				return err
+			}
+		}
+		// Single version bump for the whole edit.
+		_, err = tx.ExecContext(ctx, `UPDATE meeting SET version=version+1, updated_at=CURRENT_TIMESTAMP(3) WHERE meeting_id=?`, meetingID)
+		return err
+	})
+}
+
+// applyPasswordOp enables/disables the meeting password before live: a clear
+// retires the active verifier and disables the password; a set retires any
+// active verifier, inserts the new one, and enables the password.
+func applyPasswordOp(ctx context.Context, tx *sql.Tx, meetingID string, op *repo.PasswordOp) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE meeting_password_verifier SET status='retired', retired_at=CURRENT_TIMESTAMP(3) WHERE meeting_id=? AND status='active'`, meetingID); err != nil {
+		return err
+	}
+	if op.Clear {
+		_, err := tx.ExecContext(ctx, `UPDATE meeting SET password_enabled=0 WHERE meeting_id=?`, meetingID)
+		return err
+	}
+	if op.Verifier == nil {
+		return fmt.Errorf("edit: password set without verifier")
+	}
+	v := op.Verifier
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO meeting_password_verifier (meeting_id, algorithm, params_json, salt_id, pepper_ref, verifier, status, created_by)
+		 VALUES (?, ?, ?, ?, ?, ?, 'active', 'edit')`,
+		meetingID, v.Algorithm, v.ParamsJSON, v.SaltID, v.PepperRef, []byte(v.Verifier)); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE meeting SET password_enabled=1 WHERE meeting_id=?`, meetingID)
+	return err
+}

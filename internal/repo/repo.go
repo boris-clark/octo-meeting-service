@@ -87,6 +87,26 @@ type Store interface {
 	ShareHolder(ctx context.Context, meetingID string) (string, error)
 	// ReleaseShare clears the share-holder slot (idempotent).
 	ReleaseShare(ctx context.Context, meetingID string) error
+	// EditScheduled mutates a scheduled meeting's topic/time/duration and/or
+	// password before it goes live, under an optimistic version check. Editing a
+	// non-scheduled meeting returns ErrInvalidTransition; a stale ifMatch returns
+	// ErrVersionConflict.
+	EditScheduled(ctx context.Context, meetingID string, in EditInput, ifMatch int64) (Meeting, error)
+}
+
+// PasswordOp describes a before-live password change: Clear disables the
+// password; otherwise Verifier carries the new non-reversible verifier row.
+type PasswordOp struct {
+	Clear    bool
+	Verifier *VerifierInput
+}
+
+// EditInput carries the optional edit fields; nil fields are left unchanged.
+type EditInput struct {
+	Topic           *string
+	ScheduledStart  *time.Time
+	DurationMinutes *int
+	Password        *PasswordOp
 }
 
 // CreateResult is the outcome of CreateMeeting. On a replay it carries the

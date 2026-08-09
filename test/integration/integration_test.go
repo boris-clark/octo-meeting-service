@@ -251,3 +251,64 @@ func TestControlTransitionMySQL(t *testing.T) {
 		t.Fatalf("idempotent cancel: status=%v err=%v", m2.Status, err)
 	}
 }
+
+// TestEditScheduledMySQL exercises the before-live edit path against real MySQL:
+// topic/time mutation with a version bump, a before-live password set (verifier
+// row + password_enabled) and clear, and the invalid-transition guard once live.
+func TestEditScheduledMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	const lookupSecret = "it-lookup-secret"
+	store := storage.NewMySQLStore(db, lookupSecret)
+	minter, _ := credential.NewMinter([]byte(lookupSecret), []byte("0123456789abcdef0123456789abcdef"))
+	number, _ := credential.GenerateNumber()
+	link, _ := credential.GenerateLinkToken()
+	numCT, _ := minter.Seal(number)
+	linkCT, _ := minter.Seal(link)
+	id := "it-edit-" + number
+	if _, err := store.CreateMeeting(ctx, repo.CreateInput{
+		Meeting: repo.Meeting{MeetingID: id, SpaceID: "it-space", Type: meeting.TypeScheduled, Status: meeting.StatusScheduled, CreatorUID: "it-creator", HostUID: "it-creator", ScheduledStartAt: time.Now().Add(time.Hour).UTC(), MaxParticipants: 100, Version: 1},
+		Number:  number, LinkToken: link, NumberCiphertext: numCT, LinkCiphertext: linkCT,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	topic := "edited topic"
+	newStart := time.Now().Add(2 * time.Hour).UTC()
+	m, err := store.EditScheduled(ctx, id, repo.EditInput{Topic: &topic, ScheduledStart: &newStart}, 0)
+	if err != nil || m.Version <= 1 {
+		t.Fatalf("edit topic/time: version=%d err=%v", m.Version, err)
+	}
+
+	// Set a password before live, then verify the DB verifier accepts it.
+	enc, _ := password.DefaultArgon2Params().Hash("424242", "it-pepper")
+	m, err = store.EditScheduled(ctx, id, repo.EditInput{Password: &repo.PasswordOp{Verifier: &repo.VerifierInput{
+		Algorithm: password.Algorithm, ParamsJSON: "{}", SaltID: "inline", PepperRef: "configured", Verifier: enc,
+	}}}, 0)
+	if err != nil || !m.PasswordEnabled {
+		t.Fatalf("edit set password: enabled=%v err=%v", m.PasswordEnabled, err)
+	}
+	verifier := storage.NewMySQLPasswordVerifier(db, "it-pepper")
+	if ok, err := verifier.Verify(ctx, id, "424242"); err != nil || !ok {
+		t.Fatalf("verify after edit-set: ok=%v err=%v", ok, err)
+	}
+
+	// Clear the password before live.
+	m, err = store.EditScheduled(ctx, id, repo.EditInput{Password: &repo.PasswordOp{Clear: true}}, 0)
+	if err != nil || m.PasswordEnabled {
+		t.Fatalf("edit clear password: enabled=%v err=%v", m.PasswordEnabled, err)
+	}
+
+	// Once live, editing is rejected as an invalid transition.
+	if _, err := store.StartLive(ctx, id, time.Now().UTC()); err != nil {
+		t.Fatalf("start live: %v", err)
+	}
+	if _, err := store.EditScheduled(ctx, id, repo.EditInput{Topic: &topic}, 0); err != repo.ErrInvalidTransition {
+		t.Fatalf("edit after live: err=%v, want ErrInvalidTransition", err)
+	}
+}

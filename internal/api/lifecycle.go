@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Jerry-Xin/octo-meeting-service/internal/credential"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/authz"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/meeting"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/merr"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/password"
@@ -227,4 +228,110 @@ func payloadFingerprint(topic string, passwordEnabled bool) string {
 	}
 	sum := sha256.Sum256([]byte(topic + "|" + flag))
 	return hex.EncodeToString(sum[:])
+}
+
+type editRequest struct {
+	Topic            *string `json:"topic"`
+	ScheduledStartAt *string `json:"scheduled_start_at"`
+	DurationMinutes  *int    `json:"duration_minutes"`
+	PasswordOp       *struct {
+		Action   string `json:"action"` // "set" | "clear"
+		Password string `json:"password"`
+	} `json:"password_op"`
+}
+
+// Edit handles PATCH /meetings/:meeting_id (host, before live). It mutates
+// topic/time/duration and/or the password under the same host-authorization,
+// If-Match version, and server-clock time validation as create/cancel. The
+// frozen contract guard applies: a password change after the meeting is live
+// returns MEETING_PASSWORD_IMMUTABLE.
+func (s *Service) Edit(c *gin.Context) {
+	uid, _, ok := s.principalOr401(c)
+	if !ok {
+		return
+	}
+	meetingID := c.Param("meeting_id")
+	var req editRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		WriteError(c, merr.New(merr.Forbidden, "Invalid edit request."))
+		return
+	}
+	role, ok := s.actorRole(c, meetingID, uid)
+	if !ok {
+		return
+	}
+	if !authz.CanEditOrCancel(role) {
+		WriteError(c, merr.New(merr.Forbidden, "Only the host may edit the meeting.").WithDetail("required_role", "H"))
+		return
+	}
+
+	ctx := c.Request.Context()
+	m, found, err := s.Store.Resolve(ctx, repo.ByID, meetingID)
+	if err != nil {
+		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+		return
+	}
+	if !found {
+		WriteError(c, merr.New(merr.Forbidden, "You do not have permission to perform this action."))
+		return
+	}
+
+	// Frozen guard: the password is immutable once the meeting is live (or
+	// otherwise no longer scheduled).
+	if req.PasswordOp != nil && m.Status != meeting.StatusScheduled {
+		WriteError(c, merr.New(merr.PasswordImmutable, "The password cannot be changed after the meeting is live.").
+			WithDetail("status", string(m.Status)))
+		return
+	}
+	fieldEdit := req.Topic != nil || req.ScheduledStartAt != nil || req.DurationMinutes != nil
+	if (fieldEdit || req.PasswordOp != nil) && m.Status != meeting.StatusScheduled {
+		WriteError(c, merr.New(merr.Forbidden, "The meeting can no longer be edited."))
+		return
+	}
+
+	now := s.now()
+	in := repo.EditInput{Topic: req.Topic, DurationMinutes: req.DurationMinutes}
+	if req.ScheduledStartAt != nil {
+		start, terr := time.Parse(time.RFC3339, *req.ScheduledStartAt)
+		if terr != nil || !start.After(now) {
+			WriteError(c, merr.New(merr.TimeInvalid, "The scheduled time is invalid.").
+				WithDetail("server_now", now.UTC().Format(time.RFC3339)))
+			return
+		}
+		in.ScheduledStart = &start
+	}
+	if req.DurationMinutes != nil && *req.DurationMinutes < 1 {
+		WriteError(c, merr.New(merr.TimeInvalid, "The duration is invalid."))
+		return
+	}
+	if req.PasswordOp != nil {
+		switch req.PasswordOp.Action {
+		case "clear":
+			in.Password = &repo.PasswordOp{Clear: true}
+		case "set":
+			if ferr := password.CheckFormat(req.PasswordOp.Password); ferr != nil {
+				WriteError(c, ferr)
+				return
+			}
+			encoded, herr := s.Argon.Hash(req.PasswordOp.Password, s.Pepper)
+			if herr != nil {
+				WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+				return
+			}
+			in.Password = &repo.PasswordOp{Verifier: &repo.VerifierInput{
+				Algorithm: password.Algorithm, ParamsJSON: "{}", SaltID: "inline",
+				PepperRef: "configured", Verifier: encoded,
+			}}
+		default:
+			WriteError(c, merr.New(merr.Forbidden, "Invalid password operation."))
+			return
+		}
+	}
+
+	updated, err := s.Store.EditScheduled(ctx, meetingID, in, ifMatch(c))
+	if err != nil {
+		mapControlError(c, err)
+		return
+	}
+	WriteJSON(c, http.StatusOK, summaryOf(updated))
 }
