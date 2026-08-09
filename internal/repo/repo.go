@@ -78,15 +78,20 @@ type Store interface {
 	SetLock(ctx context.Context, meetingID string, locked bool, ifMatch int64) (Meeting, error)
 	// SetRole assigns a participant's role (H only, per the authz matrix).
 	SetRole(ctx context.Context, meetingID, uid, role string, ifMatch int64) (Meeting, error)
-	// Remove writes a terminal removal record that blocks future admission.
-	Remove(ctx context.Context, meetingID, uid string) error
-	// AcquireShare takes the single share-holder slot; ok=false and the current
-	// holder are returned on conflict.
-	AcquireShare(ctx context.Context, meetingID, uid, segmentID string) (holder string, ok bool, err error)
+	// Remove writes a terminal removal record under an optimistic version check
+	// (row-locked); it bumps the meeting version and returns the updated record.
+	Remove(ctx context.Context, meetingID, uid string, ifMatch int64) (Meeting, error)
+	// AcquireShare takes the single share-holder slot under a row-locked version
+	// check; ok=false and the current holder are returned on a share conflict,
+	// ErrVersionConflict on a stale ifMatch.
+	AcquireShare(ctx context.Context, meetingID, uid, segmentID string, ifMatch int64) (holder string, ok bool, err error)
 	// ShareHolder returns the current share-holder uid ("" if none).
 	ShareHolder(ctx context.Context, meetingID string) (string, error)
-	// ReleaseShare clears the share-holder slot (idempotent).
-	ReleaseShare(ctx context.Context, meetingID string) error
+	// ReleaseShare clears the share-holder slot only if the current holder still
+	// equals expectedHolder (closing the stop-share check-then-act race), under a
+	// row-locked version check. ErrVersionConflict on a stale version or a changed
+	// holder.
+	ReleaseShare(ctx context.Context, meetingID, expectedHolder string, ifMatch int64) (Meeting, error)
 	// EditScheduled mutates a scheduled meeting's topic/time/duration and/or
 	// password before it goes live, under an optimistic version check. Editing a
 	// non-scheduled meeting returns ErrInvalidTransition; a stale ifMatch returns

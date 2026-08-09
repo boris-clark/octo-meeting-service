@@ -91,31 +91,51 @@ func (m *MemStore) SetRole(_ context.Context, meetingID, uid, role string, ifMat
 	return *rec, nil
 }
 
-// Remove implements Store.
-func (m *MemStore) Remove(_ context.Context, meetingID, uid string) error {
+// Remove implements Store: version-checked terminal removal that bumps the
+// meeting version.
+func (m *MemStore) Remove(_ context.Context, meetingID, uid string, ifMatch int64) (Meeting, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	rec, err := m.versioned(meetingID, ifMatch)
+	if err != nil {
+		return Meeting{}, err
+	}
 	m.removed[key(meetingID, uid)] = true
-	return nil
+	rec.Version++
+	return *rec, nil
 }
 
-// AcquireShare implements Store.
-func (m *MemStore) AcquireShare(_ context.Context, meetingID, uid, _ string) (string, bool, error) {
+// AcquireShare implements Store: version-checked single-holder acquisition.
+func (m *MemStore) AcquireShare(_ context.Context, meetingID, uid, _ string, ifMatch int64) (string, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	rec, err := m.versioned(meetingID, ifMatch)
+	if err != nil {
+		return "", false, err
+	}
 	if h, ok := m.shareHolder[meetingID]; ok && h != "" && h != uid {
 		return h, false, nil
 	}
 	m.shareHolder[meetingID] = uid
+	rec.Version++
 	return uid, true, nil
 }
 
-// ReleaseShare implements Store.
-func (m *MemStore) ReleaseShare(_ context.Context, meetingID string) error {
+// ReleaseShare implements Store: clears the slot only if the current holder
+// still equals expectedHolder, under a version check.
+func (m *MemStore) ReleaseShare(_ context.Context, meetingID, expectedHolder string, ifMatch int64) (Meeting, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	rec, err := m.versioned(meetingID, ifMatch)
+	if err != nil {
+		return Meeting{}, err
+	}
+	if m.shareHolder[meetingID] != expectedHolder {
+		return Meeting{}, ErrVersionConflict // holder changed between check and update
+	}
 	delete(m.shareHolder, meetingID)
-	return nil
+	rec.Version++
+	return *rec, nil
 }
 
 // ShareHolder implements Store.

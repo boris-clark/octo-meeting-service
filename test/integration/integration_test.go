@@ -312,3 +312,86 @@ func TestEditScheduledMySQL(t *testing.T) {
 		t.Fatalf("edit after live: err=%v, want ErrInvalidTransition", err)
 	}
 }
+
+// TestWorkerLeaseRecoveryMySQL proves an expired `leased` row (a worker crashed
+// before settling it) is re-claimable, so notifications are never permanently
+// stuck.
+func TestWorkerLeaseRecoveryMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	dedupe := "it-lease-" + time.Now().UTC().Format("150405.000000")
+	// Insert a row already `leased` with an expired lease (owner crashed).
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO meeting_outbox (event_type, meeting_id, recipient_uid, dedupe_key, payload_redacted_json, status, lease_owner, lease_until)
+		 VALUES ('meeting_invite', 'it-m', 'it-u', ?, JSON_OBJECT('note','x'), 'leased', 'dead-worker', DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL 1 MINUTE))`,
+		dedupe); err != nil {
+		t.Fatalf("insert leased: %v", err)
+	}
+
+	store := storage.NewMySQLJobStore(db)
+	jobs, err := store.ClaimDue(ctx, time.Now().UTC(), "recovery-worker", 10)
+	if err != nil {
+		t.Fatalf("claim due: %v", err)
+	}
+	found := false
+	for _, j := range jobs {
+		if j.RecipientUID == "it-u" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expired-leased row was not re-claimed (permanently stuck)")
+	}
+}
+
+// TestControlVersionConflictMySQL proves the row-locked optimistic version check
+// on a mutating control (remove) against real MySQL.
+func TestControlVersionConflictMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	const lookupSecret = "it-lookup-secret"
+	store := storage.NewMySQLStore(db, lookupSecret)
+	minter, _ := credential.NewMinter([]byte(lookupSecret), []byte("0123456789abcdef0123456789abcdef"))
+	number, _ := credential.GenerateNumber()
+	link, _ := credential.GenerateLinkToken()
+	numCT, _ := minter.Seal(number)
+	linkCT, _ := minter.Seal(link)
+	id := "it-ver-" + number
+	if _, err := store.CreateMeeting(ctx, repo.CreateInput{
+		Meeting: repo.Meeting{MeetingID: id, SpaceID: "it-space", Type: meeting.TypeScheduled, Status: meeting.StatusScheduled, CreatorUID: "it-creator", HostUID: "it-creator", ScheduledStartAt: time.Now().Add(time.Hour).UTC(), MaxParticipants: 100, Version: 1},
+		Number:  number, LinkToken: link, NumberCiphertext: numCT, LinkCiphertext: linkCT,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Stale If-Match -> version conflict; correct version succeeds.
+	if _, err := store.Remove(ctx, id, "it-target", 99); err != repo.ErrVersionConflict {
+		t.Fatalf("stale remove: err=%v, want ErrVersionConflict", err)
+	}
+	m, err := store.Remove(ctx, id, "it-target", 1)
+	if err != nil || m.Version <= 1 {
+		t.Fatalf("versioned remove: version=%d err=%v", m.Version, err)
+	}
+
+	// Share acquire + a holder-race release: releasing against a wrong expected
+	// holder must not clear the slot.
+	if _, ok, err := store.AcquireShare(ctx, id, "it-creator", "seg", 0); err != nil || !ok {
+		t.Fatalf("acquire share: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.ReleaseShare(ctx, id, "someone-else", 0); err != repo.ErrVersionConflict {
+		t.Fatalf("holder-race release: err=%v, want ErrVersionConflict", err)
+	}
+	if h, _ := store.ShareHolder(ctx, id); h != "it-creator" {
+		t.Fatalf("holder cleared under race: %q", h)
+	}
+}

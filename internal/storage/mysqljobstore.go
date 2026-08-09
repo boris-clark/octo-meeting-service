@@ -12,9 +12,10 @@ import (
 
 // MySQLJobStore is the durable outbox queue backing the worker dispatcher. It
 // claims due, ready rows with FOR UPDATE SKIP LOCKED so multiple workers do not
-// double-deliver, and persists the retry/dead-letter outcome. Delivery is
-// idempotent: sent rows are never re-claimed and rows are deduped by dedupe_key
-// at enqueue time.
+// double-deliver, and re-claims expired leases (a row left `leased` past its
+// lease_until because a worker crashed before settling it) so delivery is
+// reliable under failure. Delivery is idempotent: sent rows are never re-claimed
+// and rows are deduped by dedupe_key at enqueue time.
 type MySQLJobStore struct {
 	db *sql.DB
 }
@@ -38,9 +39,11 @@ func (s *MySQLJobStore) ClaimDue(ctx context.Context, now time.Time, owner strin
 	rows, err := tx.QueryContext(ctx,
 		`SELECT id, recipient_uid, event_type, payload_redacted_json, attempt_count
 		   FROM meeting_outbox
-		  WHERE status IN ('pending','failed')
-		    AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-		    AND (lease_until IS NULL OR lease_until <= ?)
+		  WHERE (
+		          (status IN ('pending','failed') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+		          OR
+		          (status = 'leased' AND lease_until IS NOT NULL AND lease_until <= ?)
+		        )
 		  ORDER BY id
 		  LIMIT ?
 		  FOR UPDATE SKIP LOCKED`,

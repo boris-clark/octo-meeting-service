@@ -203,8 +203,8 @@ func (s *Service) RemoveParticipant(c *gin.Context) {
 		WriteError(c, merr.New(merr.Forbidden, "You may not remove this participant."))
 		return
 	}
-	if err := s.Store.Remove(c.Request.Context(), meetingID, target); err != nil {
-		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+	if _, err := s.Store.Remove(c.Request.Context(), meetingID, target, ifMatch(c)); err != nil {
+		mapControlError(c, err)
 		return
 	}
 	WriteJSON(c, http.StatusOK, gin.H{"ok": true})
@@ -271,9 +271,9 @@ func (s *Service) StartShare(c *gin.Context) {
 	if _, ok := s.actorRole(c, meetingID, uid); !ok {
 		return
 	}
-	holder, acquired, err := s.Store.AcquireShare(c.Request.Context(), meetingID, uid, req.ParticipantSegmentID)
+	holder, acquired, err := s.Store.AcquireShare(c.Request.Context(), meetingID, uid, req.ParticipantSegmentID, ifMatch(c))
 	if err != nil {
-		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+		mapControlError(c, err)
 		return
 	}
 	if !acquired {
@@ -316,8 +316,11 @@ func (s *Service) StopShare(c *gin.Context) {
 		WriteError(c, merr.New(merr.Forbidden, "You may not stop this share."))
 		return
 	}
-	if err := s.Store.ReleaseShare(c.Request.Context(), meetingID); err != nil {
-		WriteError(c, merr.New(merr.Internal, "An unexpected error occurred."))
+	// Clear only if the holder we authorized against is still the holder — the
+	// store re-checks under FOR UPDATE and returns a conflict if it changed
+	// (closing the check-then-act race), plus the optimistic version check.
+	if _, err := s.Store.ReleaseShare(c.Request.Context(), meetingID, holderUID, ifMatch(c)); err != nil {
+		mapControlError(c, err)
 		return
 	}
 	WriteJSON(c, http.StatusOK, gin.H{"active": false})

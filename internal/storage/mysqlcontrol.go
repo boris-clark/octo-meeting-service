@@ -106,21 +106,28 @@ func (s *MySQLStore) SetRole(ctx context.Context, meetingID, uid, role string, i
 	})
 }
 
-// Remove implements repo.Store.
-func (s *MySQLStore) Remove(ctx context.Context, meetingID, uid string) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO meeting_participant (meeting_id, uid, role, aggregate_state, removed, removed_at)
-		 VALUES (?, ?, 'M', 'removed', 1, CURRENT_TIMESTAMP(3))
-		 ON DUPLICATE KEY UPDATE aggregate_state='removed', removed=1, removed_at=CURRENT_TIMESTAMP(3), version=version+1, updated_at=CURRENT_TIMESTAMP(3)`,
-		meetingID, uid)
-	if err != nil {
-		return fmt.Errorf("remove participant: %w", err)
-	}
-	return nil
+// Remove implements repo.Store: a row-locked, version-checked terminal removal
+// that bumps the meeting version.
+func (s *MySQLStore) Remove(ctx context.Context, meetingID, uid string, ifMatch int64) (repo.Meeting, error) {
+	return s.inTx(ctx, meetingID, func(tx *sql.Tx) error {
+		if _, _, err := lockAndCheckVersion(ctx, tx, meetingID, ifMatch); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO meeting_participant (meeting_id, uid, role, aggregate_state, removed, removed_at)
+			 VALUES (?, ?, 'M', 'removed', 1, CURRENT_TIMESTAMP(3))
+			 ON DUPLICATE KEY UPDATE aggregate_state='removed', removed=1, removed_at=CURRENT_TIMESTAMP(3), version=version+1, updated_at=CURRENT_TIMESTAMP(3)`,
+			meetingID, uid); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE meeting SET version=version+1, updated_at=CURRENT_TIMESTAMP(3) WHERE meeting_id=?`, meetingID)
+		return err
+	})
 }
 
-// AcquireShare implements repo.Store.
-func (s *MySQLStore) AcquireShare(ctx context.Context, meetingID, uid, segmentID string) (string, bool, error) {
+// AcquireShare implements repo.Store: row-locked, version-checked single-holder
+// acquisition.
+func (s *MySQLStore) AcquireShare(ctx context.Context, meetingID, uid, segmentID string, ifMatch int64) (string, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", false, fmt.Errorf("acquire share: begin: %w", err)
@@ -132,12 +139,18 @@ func (s *MySQLStore) AcquireShare(ctx context.Context, meetingID, uid, segmentID
 		}
 	}()
 
-	var holder sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT share_holder_uid FROM meeting WHERE meeting_id = ? FOR UPDATE`, meetingID).Scan(&holder); err != nil {
+	var (
+		holder  sql.NullString
+		version int64
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT share_holder_uid, version FROM meeting WHERE meeting_id = ? FOR UPDATE`, meetingID).Scan(&holder, &version); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, repo.ErrNotFound
 		}
 		return "", false, fmt.Errorf("acquire share: lock: %w", err)
+	}
+	if ifMatch != 0 && version != ifMatch {
+		return "", false, repo.ErrVersionConflict
 	}
 	if holder.Valid && holder.String != "" && holder.String != uid {
 		return holder.String, false, nil
@@ -152,13 +165,23 @@ func (s *MySQLStore) AcquireShare(ctx context.Context, meetingID, uid, segmentID
 	return uid, true, nil
 }
 
-// ReleaseShare implements repo.Store.
-func (s *MySQLStore) ReleaseShare(ctx context.Context, meetingID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE meeting SET share_holder_uid=NULL, share_segment_id=NULL, version=version+1, updated_at=CURRENT_TIMESTAMP(3) WHERE meeting_id=?`, meetingID)
-	if err != nil {
-		return fmt.Errorf("release share: %w", err)
-	}
-	return nil
+// ReleaseShare implements repo.Store: clears the slot only if the current holder
+// still equals expectedHolder, under a row-locked version check.
+func (s *MySQLStore) ReleaseShare(ctx context.Context, meetingID, expectedHolder string, ifMatch int64) (repo.Meeting, error) {
+	return s.inTx(ctx, meetingID, func(tx *sql.Tx) error {
+		if _, _, err := lockAndCheckVersion(ctx, tx, meetingID, ifMatch); err != nil {
+			return err
+		}
+		var holder sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT share_holder_uid FROM meeting WHERE meeting_id = ?`, meetingID).Scan(&holder); err != nil {
+			return err
+		}
+		if holder.String != expectedHolder {
+			return repo.ErrVersionConflict // holder changed between check and update
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE meeting SET share_holder_uid=NULL, share_segment_id=NULL, version=version+1, updated_at=CURRENT_TIMESTAMP(3) WHERE meeting_id=?`, meetingID)
+		return err
+	})
 }
 
 // ShareHolder implements repo.Store.

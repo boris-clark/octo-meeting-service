@@ -147,3 +147,27 @@ func TestShareConflict(t *testing.T) {
 		t.Fatalf("member start after release: got %d", rec.Code)
 	}
 }
+
+func TestRemoveStaleVersionConflict(t *testing.T) {
+	h := newHarness(t, fakeMinter{token: "lk"}, time.Now())
+	controlMeeting(h, "mrv", meeting.StatusLive, "M")
+	// Host remove with a stale If-Match -> version conflict (no removal applied).
+	rec := h.do(t, http.MethodDelete, "/v1/meetings/mrv/participants/bob", "tok-alice", nil, map[string]string{"If-Match": "99"})
+	if rec.Code != http.StatusConflict || decodeCode(t, rec) != "MEETING_VERSION_CONFLICT" {
+		t.Fatalf("stale remove: got %d %s, want 409 MEETING_VERSION_CONFLICT", rec.Code, decodeCode(t, rec))
+	}
+	// The correct version succeeds and blocks admission.
+	if rec := h.do(t, http.MethodDelete, "/v1/meetings/mrv/participants/bob", "tok-alice", nil, map[string]string{"If-Match": "1"}); rec.Code != http.StatusOK {
+		t.Fatalf("versioned remove: got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestShareStartStaleVersionConflict(t *testing.T) {
+	h := newHarness(t, fakeMinter{token: "lk"}, time.Now())
+	controlMeeting(h, "msv", meeting.StatusLive, "M")
+	rec := h.do(t, http.MethodPost, "/v1/meetings/msv/share", "tok-alice",
+		map[string]any{"participant_segment_id": "seg", "share_type": "screen"}, map[string]string{"If-Match": "99"})
+	if rec.Code != http.StatusConflict || decodeCode(t, rec) != "MEETING_VERSION_CONFLICT" {
+		t.Fatalf("stale share start: got %d %s, want 409 MEETING_VERSION_CONFLICT", rec.Code, decodeCode(t, rec))
+	}
+}
