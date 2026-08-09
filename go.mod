@@ -10,7 +10,10 @@ require (
 	go.uber.org/zap v1.27.0
 )
 
-require github.com/go-sql-driver/mysql v1.8.1
+require (
+	github.com/go-sql-driver/mysql v1.8.1
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
@@ -61,5 +64,4 @@ require (
 	golang.org/x/text v0.21.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
