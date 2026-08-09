@@ -36,9 +36,12 @@ jobs:
         with:
           go-version: "1.25.x"
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+        # Build golangci-lint with the runner's Go toolchain so its embedded Go
+        # version is not older than the module's go directive (v1 binaries are
+        # built with older Go and reject go 1.25 modules).
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.4.0
+          golangci-lint run ./...
 
   security:
     runs-on: ubuntu-latest
@@ -52,6 +55,6 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
       - name: gosec
-        uses: securego/gosec@master
-        with:
-          args: ./...
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec ./...
