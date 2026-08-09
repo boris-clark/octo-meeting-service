@@ -83,6 +83,15 @@ func (s *Service) Register(rg *gin.RouterGroup) {
 	rg.POST("/meetings/admission/evaluate", s.Evaluate)
 	rg.POST("/meetings/:meeting_id/password/verify", s.VerifyPassword)
 	rg.POST("/meetings/:meeting_id/admission/finalize", s.Finalize)
+	// Lifecycle + control operations.
+	rg.POST("/meetings/:meeting_id/cancel", s.Cancel)
+	rg.POST("/meetings/:meeting_id/end", s.End)
+	rg.PUT("/meetings/:meeting_id/lock", s.Lock)
+	rg.PUT("/meetings/:meeting_id/participants/:uid/role", s.SetParticipantRole)
+	rg.DELETE("/meetings/:meeting_id/participants/:uid", s.RemoveParticipant)
+	rg.POST("/meetings/:meeting_id/controls/mute", s.Mute)
+	rg.POST("/meetings/:meeting_id/share", s.StartShare)
+	rg.DELETE("/meetings/:meeting_id/share", s.StopShare)
 }
 
 func (s *Service) newID() string {

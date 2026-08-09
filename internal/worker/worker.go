@@ -16,14 +16,22 @@ import (
 // Worker owns a bounded pool of goroutines and shuts them down cleanly when its
 // context is cancelled.
 type Worker struct {
-	cfg    config.WorkerConfig
-	logger *zap.Logger
-	wg     sync.WaitGroup
+	cfg        config.WorkerConfig
+	logger     *zap.Logger
+	dispatcher *Dispatcher
+	wg         sync.WaitGroup
 }
 
 // New constructs a Worker.
 func New(cfg config.WorkerConfig, logger *zap.Logger) *Worker {
 	return &Worker{cfg: cfg, logger: logger}
+}
+
+// WithDispatcher attaches the outbox/reminder dispatcher the loops drive. When
+// nil, the loops only observe shutdown (bootstrap behavior).
+func (w *Worker) WithDispatcher(d *Dispatcher) *Worker {
+	w.dispatcher = d
+	return w
 }
 
 // Run starts the worker loops and blocks until ctx is cancelled, then waits for
@@ -40,8 +48,8 @@ func (w *Worker) Run(ctx context.Context) {
 	w.logger.Info("worker stopped")
 }
 
-// loop is a single bounded worker. In the bootstrap it only observes shutdown;
-// job dispatch is added with the domain layer.
+// loop is a single bounded worker. It drives the dispatcher each tick when one
+// is attached, isolating errors so one bad tick never kills the loop.
 func (w *Worker) loop(ctx context.Context, id int) {
 	defer w.wg.Done()
 	ticker := time.NewTicker(w.cfg.PollBackoff)
@@ -51,7 +59,12 @@ func (w *Worker) loop(ctx context.Context, id int) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Placeholder: no jobs are dispatched in the bootstrap.
+			if w.dispatcher == nil {
+				continue
+			}
+			if _, err := w.dispatcher.Tick(ctx, time.Now().UTC()); err != nil {
+				w.logger.Warn("dispatch tick failed", zap.Int("loop", id), zap.Error(err))
+			}
 		}
 	}
 }

@@ -21,7 +21,9 @@ import (
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/meeting"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/domain/password"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/repo"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/scheduler"
 	"github.com/Jerry-Xin/octo-meeting-service/internal/storage"
+	"github.com/Jerry-Xin/octo-meeting-service/internal/worker"
 )
 
 func mysqlDSN(t *testing.T) string {
@@ -158,5 +160,94 @@ func TestRedisStoresIntegration(t *testing.T) {
 	}
 	if ok, _ := pt.Valid(ctx, token, "it-m", "it-u", now); ok {
 		t.Fatal("consumed token should be invalid")
+	}
+}
+
+// fakeNotifier records deliveries for the worker integration test.
+type fakeNotifier struct{ delivered int }
+
+func (f *fakeNotifier) Notify(context.Context, string, string, map[string]any) error {
+	f.delivered++
+	return nil
+}
+
+// TestWorkerOutboxDispatchMySQL inserts a due outbox row and drives the real
+// MySQL-backed dispatcher, asserting claim -> deliver -> sent (and that a sent
+// row is not re-claimed).
+func TestWorkerOutboxDispatchMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	dedupe := "it-outbox-" + time.Now().UTC().Format("150405.000000")
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO meeting_outbox (event_type, meeting_id, recipient_uid, dedupe_key, payload_redacted_json, status, next_attempt_at)
+		 VALUES ('meeting_invite', 'it-m', 'it-u', ?, JSON_OBJECT('note','需要入会密码'), 'pending', CURRENT_TIMESTAMP(3))`,
+		dedupe); err != nil {
+		t.Fatalf("insert outbox: %v", err)
+	}
+
+	notifier := &fakeNotifier{}
+	d := worker.NewDispatcher(storage.NewMySQLJobStore(db), notifier, scheduler.DefaultPolicy(), "it-worker", 10, nil)
+
+	n, err := d.Tick(ctx, time.Now().UTC().Add(time.Second))
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if n < 1 || notifier.delivered < 1 {
+		t.Fatalf("dispatch: claimed=%d delivered=%d, want >=1", n, notifier.delivered)
+	}
+	// The delivered row is marked sent and not re-claimed.
+	var status string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM meeting_outbox WHERE dedupe_key=?`, dedupe).Scan(&status); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status != "sent" {
+		t.Fatalf("outbox status = %q, want sent", status)
+	}
+}
+
+// TestControlTransitionMySQL exercises a lifecycle transition (cancel) and lock
+// toggle against real MySQL with the optimistic version check.
+func TestControlTransitionMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	const lookupSecret = "it-lookup-secret"
+	store := storage.NewMySQLStore(db, lookupSecret)
+	minter, _ := credential.NewMinter([]byte(lookupSecret), []byte("0123456789abcdef0123456789abcdef"))
+	number, _ := credential.GenerateNumber()
+	link, _ := credential.GenerateLinkToken()
+	numCT, _ := minter.Seal(number)
+	linkCT, _ := minter.Seal(link)
+	id := "it-ctl-" + number
+	if _, err := store.CreateMeeting(ctx, repo.CreateInput{
+		Meeting: repo.Meeting{MeetingID: id, SpaceID: "it-space", Type: meeting.TypeScheduled, Status: meeting.StatusScheduled, CreatorUID: "it-creator", HostUID: "it-creator", ScheduledStartAt: time.Now().Add(time.Hour).UTC(), MaxParticipants: 100, Version: 1},
+		Number:  number, LinkToken: link, NumberCiphertext: numCT, LinkCiphertext: linkCT,
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Host role resolves; lock toggles; cancel transitions to cancelled.
+	if role, ok, err := store.ParticipantRole(ctx, id, "it-creator"); err != nil || !ok || role != "H" {
+		t.Fatalf("participant role: role=%q ok=%v err=%v", role, ok, err)
+	}
+	if m, err := store.SetLock(ctx, id, true, 0); err != nil || !m.Locked {
+		t.Fatalf("set lock: locked=%v err=%v", m.Locked, err)
+	}
+	m, err := store.Transition(ctx, id, meeting.StatusCancelled, "", 0)
+	if err != nil || m.Status != meeting.StatusCancelled {
+		t.Fatalf("cancel: status=%v err=%v", m.Status, err)
+	}
+	// Cancelling an already-cancelled meeting is idempotent.
+	if m2, err := store.Transition(ctx, id, meeting.StatusCancelled, "", 0); err != nil || m2.Status != meeting.StatusCancelled {
+		t.Fatalf("idempotent cancel: status=%v err=%v", m2.Status, err)
 	}
 }

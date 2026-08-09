@@ -64,6 +64,29 @@ type Store interface {
 	// carrying the ORIGINAL persisted credential ciphertexts; a duplicate key
 	// with a different payload returns ErrIdempotencyConflict.
 	CreateMeeting(ctx context.Context, in CreateInput) (CreateResult, error)
+
+	// ParticipantRole returns the actor's control role for a meeting: "H" for the
+	// host, otherwise the participant's role. isParticipant is false when the
+	// actor is neither host nor a participant.
+	ParticipantRole(ctx context.Context, meetingID, uid string) (role string, isParticipant bool, err error)
+	// Transition atomically applies a status transition (cancel -> cancelled,
+	// end -> ended) under an optimistic version check. It is idempotent when the
+	// meeting is already in the target terminal state. ErrVersionConflict on a
+	// stale ifMatch (0 = no check); ErrInvalidTransition on an illegal move.
+	Transition(ctx context.Context, meetingID string, to meeting.Status, endReason string, ifMatch int64) (Meeting, error)
+	// SetLock toggles the meeting lock under an optimistic version check.
+	SetLock(ctx context.Context, meetingID string, locked bool, ifMatch int64) (Meeting, error)
+	// SetRole assigns a participant's role (H only, per the authz matrix).
+	SetRole(ctx context.Context, meetingID, uid, role string, ifMatch int64) (Meeting, error)
+	// Remove writes a terminal removal record that blocks future admission.
+	Remove(ctx context.Context, meetingID, uid string) error
+	// AcquireShare takes the single share-holder slot; ok=false and the current
+	// holder are returned on conflict.
+	AcquireShare(ctx context.Context, meetingID, uid, segmentID string) (holder string, ok bool, err error)
+	// ShareHolder returns the current share-holder uid ("" if none).
+	ShareHolder(ctx context.Context, meetingID string) (string, error)
+	// ReleaseShare clears the share-holder slot (idempotent).
+	ReleaseShare(ctx context.Context, meetingID string) error
 }
 
 // CreateResult is the outcome of CreateMeeting. On a replay it carries the
@@ -88,6 +111,8 @@ type MemStore struct {
 	activeCount  map[string]int
 	idem         map[string]idemRecord
 	creds        map[string]storedCreds
+	roles        map[string]string // meetingID|uid -> role
+	shareHolder  map[string]string // meetingID -> uid
 }
 
 type idemRecord struct {
@@ -113,6 +138,8 @@ func NewMemStore() *MemStore {
 		activeCount:  map[string]int{},
 		idem:         map[string]idemRecord{},
 		creds:        map[string]storedCreds{},
+		roles:        map[string]string{},
+		shareHolder:  map[string]string{},
 	}
 }
 

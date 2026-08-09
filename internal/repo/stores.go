@@ -19,6 +19,12 @@ var ErrNotFound = errors.New("not found")
 // different payload.
 var ErrIdempotencyConflict = errors.New("idempotency conflict")
 
+// ErrVersionConflict is returned when an optimistic If-Match version check fails.
+var ErrVersionConflict = errors.New("version conflict")
+
+// ErrInvalidTransition is returned for an illegal status transition.
+var ErrInvalidTransition = errors.New("invalid transition")
+
 // CooldownStore persists per-user+meeting password attempt state. The production
 // implementation is Redis-atomic on the hot path; the in-memory version backs
 // tests.
