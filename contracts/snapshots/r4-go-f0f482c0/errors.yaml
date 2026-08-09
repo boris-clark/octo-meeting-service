@@ -1,0 +1,38 @@
+# Error catalog snapshot — bound to architecture SHA f0f482c0
+#
+# Stable, machine-readable error codes shared across all domain endpoints.
+# The wire envelope is defined as error_response in openapi.yaml. Messages must
+# never contain secrets (passwords, link/pass tokens, LiveKit tokens) and must
+# not reveal cross-Space resource existence.
+#
+# Bootstrap defines only the transport-level baseline; domain-specific codes are
+# appended here as the domain layer lands.
+
+version: 0.1.2-bootstrap
+
+errors:
+  - code: invalid_request
+    http_status: 400
+    message: The request was malformed or failed validation.
+  - code: unauthenticated
+    http_status: 401
+    message: Authentication is required or the credential is invalid.
+  - code: forbidden
+    http_status: 403
+    message: The authenticated principal may not perform this action.
+  - code: not_found
+    http_status: 404
+    message: The requested resource does not exist.
+    # Also returned for cross-Space access to avoid leaking existence.
+  - code: conflict
+    http_status: 409
+    message: The request conflicts with the current resource state.
+  - code: rate_limited
+    http_status: 429
+    message: Too many requests; retry later.
+  - code: internal
+    http_status: 500
+    message: An unexpected error occurred.
+  - code: dependency_unavailable
+    http_status: 503
+    message: A required dependency is temporarily unavailable.

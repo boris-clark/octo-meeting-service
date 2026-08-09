@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octo-meeting-service
+  labels:
+    app: octo-meeting-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: octo-meeting-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: octo-meeting-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: REGISTRY/octo-meeting-service:TAG # replaced by the release pipeline
+          args: ["/app/api"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          envFrom:
+            - secretRef:
+                name: octo-meeting-secrets # DSN, Redis password, seam credentials
+            - configMapRef:
+                name: octo-meeting-config
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: octo-meeting-worker
+  labels:
+    app: octo-meeting-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: octo-meeting-worker
+  template:
+    metadata:
+      labels:
+        app: octo-meeting-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: REGISTRY/octo-meeting-service:TAG
+          args: ["/app/worker"]
+          envFrom:
+            - secretRef:
+                name: octo-meeting-secrets
+            - configMapRef:
+                name: octo-meeting-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

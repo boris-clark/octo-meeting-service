@@ -1,0 +1,91 @@
+openapi: 3.0.3
+info:
+  title: Octo Meeting Service
+  version: 0.1.2-bootstrap
+  description: >
+    Service-owned OpenAPI snapshot bound to architecture SHA
+    f0f482c0add1cfe81edb8cdab6418c63097be995037b582c339bbaeec0a8e871 and Go
+    runtime revision 28e3712d1aa6b5db166067404770f90314ffbf3c45eaffa70a17a3f7e16ed723.
+    Bootstrap scope: operational endpoints only. Meeting domain paths are added
+    under /v1 as domain work lands.
+servers:
+  - url: /meeting/api/v1
+    description: Public gateway base path
+  - url: /v1
+    description: Canonical service path (behind the gateway)
+paths:
+  /healthz:
+    get:
+      operationId: liveness
+      summary: Liveness probe
+      description: Always 200 while the process is serving; does not touch dependencies.
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /readyz:
+    get:
+      operationId: readiness
+      summary: Readiness probe
+      description: 200 only when every registered dependency is reachable, else 503.
+      responses:
+        "200":
+          description: All dependencies ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/readiness_response"
+        "503":
+          description: One or more dependencies not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/readiness_response"
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics
+      description: Exposed on the dedicated metrics listener.
+      responses:
+        "200":
+          description: Prometheus exposition format
+          content:
+            text/plain: {}
+components:
+  schemas:
+    readiness_response:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        dependencies:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [ok, unavailable]
+    error_response:
+      type: object
+      description: Shared error envelope for all domain endpoints (snake_case).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code from the error catalog.
+            message:
+              type: string
+              description: Human-readable, non-sensitive description.
+            request_id:
+              type: string
+              description: Correlation id for tracing.
