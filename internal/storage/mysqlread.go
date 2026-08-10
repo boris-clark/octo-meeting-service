@@ -262,6 +262,58 @@ func (s *MySQLReadStore) loadParticipants(ctx context.Context, meetingID string)
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("load participants: %w", err)
 	}
+
+	// Attach the ordered per-segment timeline to each participant (MTG-FR-081
+	// multi-segment history), grouped by uid in a single query.
+	segments, err := s.loadSegments(ctx, meetingID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Segments = segments[out[i].UID]
+	}
+	return out, nil
+}
+
+// loadSegments returns every participant segment for a meeting, grouped by uid
+// and ordered by join_at (then segment_id for a stable tie-break). Only the
+// timeline fields are selected — never device_id_hash, livekit_identity, or any
+// credential material.
+func (s *MySQLReadStore) loadSegments(ctx context.Context, meetingID string) (map[string][]repo.MeetingSegment, error) {
+	const q = `SELECT uid, segment_id, join_at, leave_at, end_reason, superseded_by_segment_id
+		FROM meeting_participant_segment WHERE meeting_id = ? ORDER BY uid ASC, join_at ASC, segment_id ASC`
+	rows, err := s.db.QueryContext(ctx, q, meetingID)
+	if err != nil {
+		return nil, fmt.Errorf("load segments: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := map[string][]repo.MeetingSegment{}
+	for rows.Next() {
+		var (
+			uid          string
+			seg          repo.MeetingSegment
+			joinAt       sql.NullTime
+			leaveAt      sql.NullTime
+			endReason    sql.NullString
+			supersededBy sql.NullString
+		)
+		if err := rows.Scan(&uid, &seg.SegmentID, &joinAt, &leaveAt, &endReason, &supersededBy); err != nil {
+			return nil, fmt.Errorf("scan segment: %w", err)
+		}
+		if joinAt.Valid {
+			seg.JoinAt = joinAt.Time.UTC()
+		}
+		if leaveAt.Valid {
+			seg.LeaveAt = leaveAt.Time.UTC()
+		}
+		seg.EndReason = endReason.String
+		seg.SupersededBySegmentID = supersededBy.String
+		out[uid] = append(out[uid], seg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load segments: %w", err)
+	}
 	return out, nil
 }
 

@@ -91,7 +91,8 @@ type MeetingListPage struct {
 
 // MeetingParticipant is the identity-aggregated participant row (openapi
 // participant): one entry per uid with the first-join/last-leave envelope across
-// all of that uid's segments.
+// all of that uid's segments, plus the ordered per-segment timeline (MTG-FR-081
+// multi-segment history) in Segments.
 type MeetingParticipant struct {
 	UID            string
 	Role           string
@@ -100,6 +101,18 @@ type MeetingParticipant struct {
 	FirstJoinedAt  time.Time
 	LastLeftAt     time.Time
 	Version        int64
+	Segments       []MeetingSegment
+}
+
+// MeetingSegment is one join/leave interval of a participant (openapi
+// participant_segment, display subset). It exposes only the timeline fields —
+// never device_id_hash, livekit_identity, or any credential material.
+type MeetingSegment struct {
+	SegmentID             string
+	JoinAt                time.Time
+	LeaveAt               time.Time
+	EndReason             string
+	SupersededBySegmentID string
 }
 
 // MeetingInvite is an invite row (openapi invite).

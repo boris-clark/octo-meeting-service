@@ -395,3 +395,64 @@ func TestControlVersionConflictMySQL(t *testing.T) {
 		t.Fatalf("holder cleared under race: %q", h)
 	}
 }
+
+// TestReadStoreMultiSegmentDetailMySQL proves the read store actually queries
+// meeting_participant_segment and nests the ordered per-segment timeline (incl.
+// superseded handling) under each identity-aggregated participant, over real
+// MySQL (MTG-FR-081 / v0.3 detail contract).
+func TestReadStoreMultiSegmentDetailMySQL(t *testing.T) {
+	db, err := sql.Open("mysql", mysqlDSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+
+	base := time.Now().UTC().Truncate(time.Second)
+	id := "it-seg-" + base.Format("150405.000")
+
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO meeting (meeting_id, space_id, type, status, topic, creator_uid, host_uid,
+			scheduled_start_at, actual_start_at, ended_at, end_reason, max_participants, version)
+		 VALUES (?, 'it-space', 'scheduled', 'ended', 'Segments', 'it-creator', 'it-creator', ?, ?, ?, 'host_end', 100, 3)`,
+		id, base, base.Add(2*time.Minute), base.Add(30*time.Minute)); err != nil {
+		t.Fatalf("insert meeting: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO meeting_participant (meeting_id, uid, role, aggregate_state, first_joined_at, last_left_at, version)
+		 VALUES (?, 'it-bob', 'M', 'left', ?, ?, 2)`,
+		id, base.Add(3*time.Minute), base.Add(29*time.Minute)); err != nil {
+		t.Fatalf("insert participant: %v", err)
+	}
+	// Two segments for the same uid; the first was superseded by the second.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO meeting_participant_segment (segment_id, meeting_id, uid, device_id_hash, livekit_identity, join_at, leave_at, end_reason, superseded_by_segment_id)
+		 VALUES ('it-seg-1', ?, 'it-bob', 'dev-hash-1', 'lk-1', ?, ?, 'superseded', 'it-seg-2'),
+		        ('it-seg-2', ?, 'it-bob', 'dev-hash-2', 'lk-2', ?, ?, 'left', NULL)`,
+		id, base.Add(3*time.Minute), base.Add(12*time.Minute),
+		id, base.Add(14*time.Minute), base.Add(29*time.Minute)); err != nil {
+		t.Fatalf("insert segments: %v", err)
+	}
+
+	read := storage.NewMySQLReadStore(db)
+	d, found, err := read.GetMeetingDetail(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("GetMeetingDetail: found=%v err=%v", found, err)
+	}
+	if len(d.Participants) != 1 || d.Participants[0].UID != "it-bob" {
+		t.Fatalf("participants: %+v", d.Participants)
+	}
+	segs := d.Participants[0].Segments
+	if len(segs) != 2 {
+		t.Fatalf("want 2 segments, got %+v", segs)
+	}
+	if segs[0].SegmentID != "it-seg-1" || segs[0].EndReason != "superseded" || segs[0].SupersededBySegmentID != "it-seg-2" || segs[0].LeaveAt.IsZero() {
+		t.Fatalf("segment 0 wrong: %+v", segs[0])
+	}
+	if segs[1].SegmentID != "it-seg-2" || segs[1].EndReason != "left" || segs[1].SupersededBySegmentID != "" || segs[1].JoinAt.IsZero() {
+		t.Fatalf("segment 1 wrong: %+v", segs[1])
+	}
+	if !segs[0].JoinAt.Before(segs[1].JoinAt) {
+		t.Fatalf("segments not ordered by join_at: %v vs %v", segs[0].JoinAt, segs[1].JoinAt)
+	}
+}

@@ -203,7 +203,14 @@ func TestDetailAuthorizedCreator(t *testing.T) {
 		Topic: "Retro", ScheduledStartAt: start, ActualStartAt: start.Add(2 * time.Minute),
 		EndedAt: start.Add(30 * time.Minute), EndReason: "host_end", PasswordEnabled: true, Version: 8,
 	}, "alice", "alice", func(d *repo.MeetingDetail) {
-		d.Participants = []repo.MeetingParticipant{{UID: "bob", Role: "M", AggregateState: "left", FirstJoinedAt: start.Add(3 * time.Minute), LastLeftAt: start.Add(29 * time.Minute), Version: 2}}
+		d.Participants = []repo.MeetingParticipant{{
+			UID: "bob", Role: "M", AggregateState: "left",
+			FirstJoinedAt: start.Add(3 * time.Minute), LastLeftAt: start.Add(29 * time.Minute), Version: 2,
+			Segments: []repo.MeetingSegment{
+				{SegmentID: "seg-1", JoinAt: start.Add(3 * time.Minute), LeaveAt: start.Add(12 * time.Minute), EndReason: "superseded", SupersededBySegmentID: "seg-2"},
+				{SegmentID: "seg-2", JoinAt: start.Add(14 * time.Minute), LeaveAt: start.Add(29 * time.Minute), EndReason: "left"},
+			},
+		}}
 		d.Invites = []repo.MeetingInvite{{InviteeUID: "carol", Status: "invited", InvitedBy: "alice", Version: 1}}
 	})
 
@@ -222,6 +229,13 @@ func TestDetailAuthorizedCreator(t *testing.T) {
 			UID           string `json:"uid"`
 			FirstJoinedAt string `json:"first_joined_at"`
 			LastLeftAt    string `json:"last_left_at"`
+			Segments      []struct {
+				SegmentID             string `json:"segment_id"`
+				JoinAt                string `json:"join_at"`
+				LeaveAt               string `json:"leave_at"`
+				EndReason             string `json:"end_reason"`
+				SupersededBySegmentID string `json:"superseded_by_segment_id"`
+			} `json:"segments"`
 		} `json:"participants"`
 		Invites []struct {
 			InviteeUID string `json:"invitee_uid"`
@@ -238,6 +252,18 @@ func TestDetailAuthorizedCreator(t *testing.T) {
 	}
 	if len(body.Participants) != 1 || body.Participants[0].UID != "bob" || body.Participants[0].LastLeftAt == "" {
 		t.Fatalf("participants wrong: %+v", body.Participants)
+	}
+	// Multi-segment timeline: ordered by join_at, superseded segment first with a
+	// forward pointer, then the terminal "left" segment (MTG-FR-081).
+	segs := body.Participants[0].Segments
+	if len(segs) != 2 {
+		t.Fatalf("want 2 segments, got %+v", segs)
+	}
+	if segs[0].SegmentID != "seg-1" || segs[0].EndReason != "superseded" || segs[0].SupersededBySegmentID != "seg-2" || segs[0].LeaveAt == "" {
+		t.Fatalf("segment 0 wrong: %+v", segs[0])
+	}
+	if segs[1].SegmentID != "seg-2" || segs[1].EndReason != "left" || segs[1].SupersededBySegmentID != "" || segs[1].JoinAt == "" {
+		t.Fatalf("segment 1 wrong: %+v", segs[1])
 	}
 	if len(body.Invites) != 1 || body.Invites[0].InviteeUID != "carol" {
 		t.Fatalf("invites wrong: %+v", body.Invites)

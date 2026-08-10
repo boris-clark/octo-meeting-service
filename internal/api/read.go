@@ -39,15 +39,29 @@ type meetingListResponseDTO struct {
 	NextPageToken string              `json:"next_page_token,omitempty"`
 }
 
-// participantDTO is the identity-aggregated participant row (openapi participant).
+// participantDTO is the identity-aggregated participant row (openapi participant)
+// extended with the ordered per-segment timeline (MTG-FR-081 multi-segment
+// history).
 type participantDTO struct {
-	UID            string  `json:"uid"`
-	Role           string  `json:"role"`
-	AggregateState string  `json:"aggregate_state"`
-	Removed        bool    `json:"removed"`
-	FirstJoinedAt  *string `json:"first_joined_at,omitempty"`
-	LastLeftAt     *string `json:"last_left_at,omitempty"`
-	Version        int64   `json:"version"`
+	UID            string       `json:"uid"`
+	Role           string       `json:"role"`
+	AggregateState string       `json:"aggregate_state"`
+	Removed        bool         `json:"removed"`
+	FirstJoinedAt  *string      `json:"first_joined_at,omitempty"`
+	LastLeftAt     *string      `json:"last_left_at,omitempty"`
+	Version        int64        `json:"version"`
+	Segments       []segmentDTO `json:"segments"`
+}
+
+// segmentDTO is one join/leave interval (openapi participant_segment, display
+// subset). Only timeline fields are exposed — never device_id_hash,
+// livekit_identity, or credential material.
+type segmentDTO struct {
+	SegmentID             string  `json:"segment_id"`
+	JoinAt                *string `json:"join_at,omitempty"`
+	LeaveAt               *string `json:"leave_at,omitempty"`
+	EndReason             string  `json:"end_reason,omitempty"`
+	SupersededBySegmentID string  `json:"superseded_by_segment_id,omitempty"`
 }
 
 // inviteDTO is an invite row (openapi invite).
@@ -190,6 +204,16 @@ func (s *Service) toDetailDTO(d repo.MeetingDetail, uid string) meetingDetailDTO
 		}
 	}
 	for _, pt := range d.Participants {
+		segments := make([]segmentDTO, 0, len(pt.Segments))
+		for _, sg := range pt.Segments {
+			segments = append(segments, segmentDTO{
+				SegmentID:             sg.SegmentID,
+				JoinAt:                isoPtr(sg.JoinAt),
+				LeaveAt:               isoPtr(sg.LeaveAt),
+				EndReason:             sg.EndReason,
+				SupersededBySegmentID: sg.SupersededBySegmentID,
+			})
+		}
 		out.Participants = append(out.Participants, participantDTO{
 			UID:            pt.UID,
 			Role:           pt.Role,
@@ -198,6 +222,7 @@ func (s *Service) toDetailDTO(d repo.MeetingDetail, uid string) meetingDetailDTO
 			FirstJoinedAt:  isoPtr(pt.FirstJoinedAt),
 			LastLeftAt:     isoPtr(pt.LastLeftAt),
 			Version:        pt.Version,
+			Segments:       segments,
 		})
 	}
 	for _, iv := range d.Invites {
