@@ -47,6 +47,7 @@ func buildTestEngine(basePath string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	svc := &api.Service{
 		Store:      repo.NewMemStore(),
+		ReadStore:  repo.NewMemReadStore(),
 		Space:      stubSpace{},
 		Cooldown:   repo.NewMemCooldownStore(),
 		PassTokens: repo.NewMemPassTokenStore(),
@@ -126,6 +127,58 @@ func TestRealEntrypointMountsAdmissionRoutes(t *testing.T) {
 	miss := request(t, e, http.MethodGet, base+"/does-not-exist", "good", nil)
 	if miss.Code != http.StatusNotFound || codeOf(miss) == "MEETING_AUTH_REQUIRED" {
 		t.Fatalf("unmounted path: got %d %s", miss.Code, codeOf(miss))
+	}
+}
+
+// TestRealEntrypointMountsReadRoutes proves the binary's wiring exposes the v0.3
+// read endpoints (GET /meetings list, GET /meetings/:meeting_id detail) under the
+// configured base path, guarded by the same fail-closed identity middleware as
+// the write/control routes: without a credential each returns 401
+// MEETING_AUTH_REQUIRED (a mounted, identity-guarded route) rather than gin's
+// plain 404 for an absent route.
+func TestRealEntrypointMountsReadRoutes(t *testing.T) {
+	const base = "/meeting/api/v1"
+	e := buildTestEngine(base)
+
+	for _, p := range []string{
+		base + "/meetings",
+		base + "/meetings/m1",
+	} {
+		rec := request(t, e, http.MethodGet, p, "", nil)
+		if rec.Code != http.StatusUnauthorized || codeOf(rec) != "MEETING_AUTH_REQUIRED" {
+			t.Fatalf("%s: got %d %s, want 401 MEETING_AUTH_REQUIRED (route mounted + identity guarded)", p, rec.Code, codeOf(rec))
+		}
+	}
+
+	// With a verified identity, the list handler is reached: an empty store returns
+	// HTTP 200 with an empty items array (never 404), proving the route is wired to
+	// the read handler and honors the empty-state contract.
+	rec := request(t, e, http.MethodGet, base+"/meetings?view=upcoming", "good", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorized list: got %d, want 200", rec.Code)
+	}
+	var listBody struct {
+		Items         []map[string]any `json:"items"`
+		NextPageToken string           `json:"next_page_token"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listBody); err != nil {
+		t.Fatalf("authorized list: decode: %v", err)
+	}
+	if listBody.Items == nil {
+		t.Fatalf("authorized list: items must be a (possibly empty) array, got null: %s", rec.Body.String())
+	}
+
+	// An unknown view is rejected with a canonical envelope, not silently aliased.
+	bad := request(t, e, http.MethodGet, base+"/meetings?view=ongoing", "good", nil)
+	if bad.Code == http.StatusOK || codeOf(bad) == "" {
+		t.Fatalf("unknown view: got %d %s, want a canonical error envelope", bad.Code, codeOf(bad))
+	}
+
+	// Detail for an unknown meeting is an indistinguishable 404 credential-invalid,
+	// leaking neither existence nor credentials.
+	nf := request(t, e, http.MethodGet, base+"/meetings/does-not-exist", "good", nil)
+	if nf.Code != http.StatusNotFound || codeOf(nf) != "MEETING_CREDENTIAL_INVALID" {
+		t.Fatalf("detail unknown meeting: got %d %s, want 404 MEETING_CREDENTIAL_INVALID", nf.Code, codeOf(nf))
 	}
 }
 

@@ -51,6 +51,7 @@ func DefaultConfig() Config {
 // Service holds the admission collaborators.
 type Service struct {
 	Store      repo.Store
+	ReadStore  repo.MeetingReadStore
 	Space      seams.Space
 	Cooldown   repo.CooldownStore
 	PassTokens repo.PassTokenStore
@@ -81,6 +82,11 @@ func (s *Service) Register(rg *gin.RouterGroup) {
 	rg.POST("/meetings/quick-create", s.QuickCreate)
 	rg.POST("/meetings", s.Schedule)
 	rg.PATCH("/meetings/:meeting_id", s.Edit)
+	// Read endpoints (approved v0.3 read contract). GET-only; the existing
+	// PATCH /meetings/:meeting_id write handler above is unchanged, keeping method
+	// separation on the detail path.
+	rg.GET("/meetings", s.ListMeetings)
+	rg.GET("/meetings/:meeting_id", s.GetMeeting)
 	rg.POST("/meetings/admission/evaluate", s.Evaluate)
 	rg.POST("/meetings/:meeting_id/password/verify", s.VerifyPassword)
 	rg.POST("/meetings/:meeting_id/admission/finalize", s.Finalize)
