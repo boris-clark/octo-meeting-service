@@ -156,6 +156,7 @@ func buildService(cfg *config.Config, db *sql.DB, rc *redis.Client, logger *zap.
 
 	return &api.Service{
 		Store:         storage.NewMySQLStore(db, cfg.Credential.LookupSecret),
+		ReadStore:     storage.NewMySQLReadStore(db),
 		Space:         httpclient.NewSpaceClient(seamOptions(cfg.Seams.Space, cfg.Internal.ServiceToken)),
 		Cooldown:      storage.NewRedisCooldownStore(rc, cooldownTTL),
 		PassTokens:    storage.NewRedisPassTokenStore(rc, passTokenMaxTTL),
